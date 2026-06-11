@@ -56,6 +56,7 @@ target_include_directories(FluidSync PRIVATE
 # Add any user requested libraries
 target_link_libraries(FluidSync 
         pico_cyw43_arch_none
+        hardware_pwm
         )
 
 pico_add_extra_outputs(FluidSync)

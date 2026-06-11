@@ -1,27 +1,29 @@
-//? sudo screen /dev/ttyACM0 115200
-
 #include <stdio.h>
 #include "pico/stdlib.h"
-#include "pico/cyw43_arch.h"
+#include "hardware/pwm.h"
 
+//* test pump pin
+#define MOSFET_PIN 15
 
+int main() {
 
-
-int main()
-{
     stdio_init_all();
 
-    // Initialise the Wi-Fi chip
-    if (cyw43_arch_init()) {
-        printf("Wi-Fi init failed\n");
-        return -1;
-    }
+    gpio_set_function(MOSFET_PIN, GPIO_FUNC_PWM);
 
-    // Example to turn on the Pico W LED
-    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+    uint slice_num = pwm_gpio_to_slice_num(MOSFET_PIN);
+    pwm_set_wrap(slice_num, 65535);
+    pwm_set_enabled(slice_num, true);
+
+    pwm_set_gpio_level(MOSFET_PIN, 0);
+    sleep_ms(2000); 
+
+    printf("Pompa al 100%% (velocità massima)...\n");
+    pwm_set_gpio_level(MOSFET_PIN, 65535);
 
     while (true) {
-        printf("Hello, world!\n");
-        sleep_ms(1000);
+        sleep_ms(5000);
     }
+
+    return 0;
 }
