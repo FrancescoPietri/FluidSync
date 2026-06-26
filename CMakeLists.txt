@@ -36,6 +36,9 @@ pico_sdk_init()
 # Add executable. Default name is the project name, version 0.1
 
 add_executable(FluidSync FluidSync.c )
+add_subdirectory(lvgl)
+
+target_include_directories(lvgl PUBLIC ${CMAKE_CURRENT_LIST_DIR})
 
 pico_set_program_name(FluidSync "FluidSync")
 pico_set_program_version(FluidSync "0.1")
@@ -57,6 +60,9 @@ target_include_directories(FluidSync PRIVATE
 target_link_libraries(FluidSync 
         pico_cyw43_arch_none
         hardware_pwm
+        lvgl
+        hardware_spi
+        hardware_timer
         )
 
 pico_add_extra_outputs(FluidSync)
