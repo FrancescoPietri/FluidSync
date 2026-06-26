@@ -26,8 +26,8 @@ uint slice;
 uint channel;
 
 //* Distance Sensor Pin
-#define DISTANCE_ECHO 6
-#define DISTANCE_TRIG 7
+#define DISTANCE_ECHO 7
+#define DISTANCE_TRIG 6
 
 //* Button Pin
 #define BUTTON_REQ 9
@@ -168,10 +168,20 @@ void init_servo_motor() {
     pwm_set_enabled(slice, true);
 }
 
+//* Button init
 void init_req_button() {
     gpio_init(BUTTON_REQ);
     gpio_set_dir(BUTTON_REQ, GPIO_IN);
     gpio_pull_up(BUTTON_REQ);
+}
+
+void init_distance_sensor() {
+    gpio_init(DISTANCE_ECHO);
+    gpio_set_dir(DISTANCE_ECHO, GPIO_IN);
+
+    gpio_init(DISTANCE_TRIG);
+    gpio_set_dir(DISTANCE_TRIG, GPIO_OUT);
+    gpio_put(DISTANCE_TRIG, 0);
 }
 
 //* Full system init
@@ -183,6 +193,30 @@ void init_fluidsync() {
     lv_init();
     spi_init(SPI_PORT, 10000 * 1000);
     init_req_button();
+    init_distance_sensor();
+}
+
+float get_distance() {
+    
+    gpio_put(DISTANCE_TRIG, 1);
+    sleep_us(10);
+    gpio_put(DISTANCE_TRIG, 0);
+
+    uint32_t timeout = time_us_32() + 30000; 
+    while (gpio_get(DISTANCE_ECHO) == 0) {
+        if (time_us_32() > timeout) return -1.0f; 
+    }
+    uint32_t start_time = time_us_32();
+
+    timeout = time_us_32() + 30000;
+    while (gpio_get(DISTANCE_ECHO) == 1) {
+        if (time_us_32() > timeout) return -1.0f;
+    }
+    uint32_t end_time = time_us_32();
+
+    uint32_t pulse_duration = end_time - start_time;
+
+    return (pulse_duration * 0.0343f) / 2.0f;
 }
 
 int main() {
@@ -226,6 +260,9 @@ int main() {
     next_servo_time = make_timeout_time_ms(1000);
 
     while (true) {
+
+        printf("distance: %f\n", get_distance());
+
         lv_tick_inc(5);
         lv_timer_handler();
 
