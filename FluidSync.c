@@ -5,7 +5,14 @@
 #include "hardware/timer.h"
 #include "lvgl/lvgl.h"
 
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+
+#define N_MAX_ORDER 10
+
 //* Pumps Pins
+#define N_PUMPS 6
 #define PUMP_4 15
 #define PUMP_3 14
 #define PUMP_5 13
@@ -14,7 +21,8 @@
 #define PUMP_6 10
 
 //* Servo Motor Pin
-#define SERVO_MOTOR 8
+#define CAROUSEL_SERVO 8
+#define CAROUSEL_CUPS_SLOTS 4
 uint carousel_positions[5] = {
     0,      //rest position to enable the user to take off the cups
     625,    //cup 1
@@ -30,7 +38,7 @@ uint channel;
 #define DISTANCE_TRIG 6
 
 //* Button Pin
-#define BUTTON_REQ 9
+#define UNLOAD_BUTTON 9
 
 //* TFT Display Pins
 #define TFT_SDA 18
@@ -159,9 +167,9 @@ void init_pumps() {
 
 //* Carousel servo init
 void init_servo_motor() {
-    gpio_set_function(SERVO_MOTOR, GPIO_FUNC_PWM);
-    slice   = pwm_gpio_to_slice_num(SERVO_MOTOR);
-    channel = pwm_gpio_to_channel(SERVO_MOTOR);
+    gpio_set_function(CAROUSEL_SERVO, GPIO_FUNC_PWM);
+    slice   = pwm_gpio_to_slice_num(CAROUSEL_SERVO);
+    channel = pwm_gpio_to_channel(CAROUSEL_SERVO);
 
     pwm_set_clkdiv(slice, 100.0f);  
     pwm_set_wrap(slice, 24999);     
@@ -170,9 +178,9 @@ void init_servo_motor() {
 
 //* Button init
 void init_req_button() {
-    gpio_init(BUTTON_REQ);
-    gpio_set_dir(BUTTON_REQ, GPIO_IN);
-    gpio_pull_up(BUTTON_REQ);
+    gpio_init(UNLOAD_BUTTON);
+    gpio_set_dir(UNLOAD_BUTTON, GPIO_IN);
+    gpio_pull_up(UNLOAD_BUTTON);
 }
 
 void init_distance_sensor() {
@@ -219,8 +227,138 @@ float get_distance() {
     return (pulse_duration * 0.0343f) / 2.0f;
 }
 
-int main() {
+typedef struct {
+    uint n_components; //number of mixed liquids
+    uint pump_output[N_PUMPS]; //define if a pump needs to be activated [0=off; 1=on]
+    int in_queue;
+} mix;
 
+struct output_carousel_t {
+    int carousel_slot[CAROUSEL_CUPS_SLOTS]; //0=ready; 1=full; 2=not ready, no cup in the slot
+    int n_filled_slot;
+    int n_ready_slot;
+    int n_not_ready_slot;
+    int bl_cr;
+    SemaphoreHandle_t carousel_sem; //carousel manager attende istruzioni da pumps manager su questo mux
+    SemaphoreHandle_t carousel_mux; 
+} output_carousel;
+
+void carousel_init() {
+    output_carousel.carousel_sem = xSemaphoreCreateBinary();
+    output_carousel.carousel_mux = xSemaphoreCreateMutex();
+}
+
+typedef struct{
+    mix order_queue[N_MAX_ORDER];
+    int order_head;
+    int order_tail;
+    int order_counter;
+}  order_c_buffer;
+
+struct manager_t {
+    order_c_buffer order_buffer;
+    SemaphoreHandle_t m_mux; //mutex access manager
+    SemaphoreHandle_t order_sem; //if no order are placed task1A wait on this mux 
+    SemaphoreHandle_t calibration_sem; 
+    int bl_out; //check if task1A output is waiting
+} manager;
+
+void manager_init() {
+    manager.m_mux = xSemaphoreCreateMutex();
+    manager.order_sem = xSemaphoreCreateBinary();
+    manager.calibration_sem = xSemaphoreCreateBinary();
+}
+
+void pumps_manager(void *pvParameters){
+    while(1){
+        //controlla se ci sono ordini -> prendo  m_mux e controllo order_counter -> se non ci sono mi metto in attesa su order_mux
+        xSemaphoreTake(manager.m_mux, portMAX_DELAY); //accedo al manager
+        if(manager.order_buffer.order_counter==0){
+            manager.bl_out++; 
+            xSemaphoreGive(manager.m_mux);
+            xSemaphoreTake(manager.order_sem, portMAX_DELAY); //aspetto un ordine e mi blocco
+            xSemaphoreGive(output_carousel.carousel_sem);
+        }else{
+            //pumps manager e' sicuro che ci sia un ordine da erogare
+            //sveglia in carosello in modo che possa calibrarsi e posizionare un bicchiere libero
+            xSemaphoreGive(manager.m_mux);
+            xSemaphoreGive(output_carousel.carousel_sem);
+        }
+
+        //pumps manager attende che carousel manager faccia la calibrazione.
+        xSemaphoreTake(manager.calibration_sem, portMAX_DELAY);
+        xSemaphoreTake(manager.m_mux, portMAX_DELAY);
+
+        //il bicchiere e' in posizione possiamo estrarre il mix da erogare.
+        mix out_mix;
+        pop_order(&manager.order_buffer, &out_mix);
+
+        
+    }
+}
+
+void carousel_manager(void *pvParameters){
+    while(1){
+        xSemaphoreTake(output_carousel.carousel_sem, portMAX_DELAY); //si mette in attesa di ricere istruzioni da parte di pumps_manager
+        xSemaphoreTake(output_carousel.carousel_mux, portMAX_DELAY);
+        do{
+            if(output_carousel.n_ready_slot==0){
+                output_carousel.bl_cr++;
+                xSemaphoreGive(output_carousel.carousel_mux);
+                xSemaphoreTake(output_carousel.carousel_sem, portMAX_DELAY); //si mette in attesa che l'utente scarichi il carosello
+                //token passing da taskC.0
+                output_carousel.bl_cr--; 
+            }
+            for(int i=0; i<CAROUSEL_CUPS_SLOTS; i++){
+                //move to slot i
+                switch(output_carousel.carousel_slot[i]){
+                    case 0: 
+                        //increment ready slot, remember this as last ready slot
+                        break;
+                    case 1: 
+                        //skip
+                        break;
+                    case 2:
+                        if(get_distance()<15.0){
+                            output_carousel.carousel_slot[i]=0;
+                            //increment ready slot, decrement not ready slot, remember this as last ready slot
+                        }
+                }
+            }
+        }while(output_carousel.n_ready_slot==0);
+        //move to last noted ready slot and wakeup pumps manager
+        xSemaphoreGive(output_carousel.carousel_mux);
+        xSemaphoreGive(manager.calibration_sem);
+    }     
+}
+
+
+bool push_order(order_c_buffer *cb, mix m){
+    if (cb->order_head==N_MAX_ORDER){
+        return false;
+    }
+    cb->order_queue[cb->order_head]=m;
+    cb->order_head = (cb->order_head +1)%N_MAX_ORDER;
+    cb->order_counter++;
+    return true;
+}
+
+bool pop_order(order_c_buffer *cb, mix *m){
+    if(cb->order_tail==0){
+        return false;
+    }
+    *m = cb->order_queue[cb->order_tail];
+    cb->order_tail=(cb->order_tail+1)%N_MAX_ORDER;
+    cb->order_counter--;
+    return true;
+}
+
+int main(){
+
+}
+
+/*
+int main() {
     init_fluidsync();
 
     gpio_put(PUMP_4, 0);
@@ -272,7 +410,7 @@ int main() {
             next_servo_time = make_timeout_time_ms(1000);
         }
 
-        bool current_state = gpio_get(BUTTON_REQ);
+        bool current_state = gpio_get(UNLOAD_BUTTON);
 
         if (!current_state) {
             lv_obj_set_style_bg_color(rect, lv_color_hex(0x00FF00), LV_PART_MAIN);
@@ -285,3 +423,4 @@ int main() {
 
     return 0;
 }
+*/
