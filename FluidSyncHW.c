@@ -1,3 +1,4 @@
+//FluidSync - livello hardware (driver e init), dal codice hardware di Francesco
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include "hardware/pwm.h"
@@ -7,73 +8,39 @@
 
 #include "FreeRTOS.h"
 #include "task.h"
-#include "semphr.h"
 
-#define N_MAX_ORDER 10
+#include "FluidSyncHW.h"
 
-//* Pumps Pins
-#define N_PUMPS 6
-#define PUMP_4 15
-#define PUMP_3 14
-#define PUMP_5 13
-#define PUMP_1 12
-#define PUMP_2 11 
-#define PUMP_6 10
+static const uint pump_pins[N_PUMPS] = { PUMP_1, PUMP_2, PUMP_3, PUMP_4, PUMP_5, PUMP_6 };
 
-//* Servo Motor Pin
-#define CAROUSEL_SERVO 8
-#define CAROUSEL_CUPS_SLOTS 4
-uint carousel_positions[5] = {
-    0,      //rest position to enable the user to take off the cups
-    625,    //cup 1
-    1250,   //cup 2
-    2125,   //cup 3
-    2819    //cup 4
-};
-uint slice;
-uint channel;
+static uint slice;
+static uint channel;
 
-//* Distance Sensor Pin
-#define DISTANCE_ECHO 7
-#define DISTANCE_TRIG 6
-
-//* Button Pin
-#define UNLOAD_BUTTON 9
-
-//* TFT Display Pins
-#define TFT_SDA 18
-#define TFT_SCL 19
-#define TFT_RST 20
-#define TFT_DC 21
-#define TFT_CS 22
-#define SPI_PORT spi0
-#define TFT_HOR_RES 240
-#define TFT_VER_RES 320
 
 //* TFT display functions and init
-void tft_write_cmd(uint8_t cmd) {
-    gpio_put(TFT_DC, 0); 
+static void tft_write_cmd(uint8_t cmd) {
+    gpio_put(TFT_DC, 0);
     gpio_put(TFT_CS, 0);
     spi_write_blocking(SPI_PORT, &cmd, 1);
     gpio_put(TFT_CS, 1);
 }
 
-void tft_write_data(uint8_t data) {
+static void tft_write_data(uint8_t data) {
     gpio_put(TFT_DC, 1);
     gpio_put(TFT_CS, 0);
     spi_write_blocking(SPI_PORT, &data, 1);
     gpio_put(TFT_CS, 1);
 }
 
-void tft_hardware_init() {
+static void tft_hardware_init() {
     spi_init(SPI_PORT, 30000 * 1000);
     gpio_set_function(TFT_SDA, GPIO_FUNC_SPI);
     gpio_set_function(TFT_SCL, GPIO_FUNC_SPI);
-    gpio_init(TFT_RST); 
+    gpio_init(TFT_RST);
     gpio_set_dir(TFT_RST, GPIO_OUT);
-    gpio_init(TFT_DC);  
+    gpio_init(TFT_DC);
     gpio_set_dir(TFT_DC, GPIO_OUT);
-    gpio_init(TFT_CS);  
+    gpio_init(TFT_CS);
     gpio_set_dir(TFT_CS, GPIO_OUT);
     gpio_put(TFT_CS, 1);
 
@@ -88,7 +55,7 @@ void tft_hardware_init() {
     tft_write_data(0x00); // Portrait, RGB
 
     tft_write_cmd(0x3A);  // COLMOD - pixel format
-    tft_write_data(0x55); // 16 bit / pixel (RGB565) ← fondamentale per LVGL
+    tft_write_data(0x55); // 16 bit / pixel (RGB565) <- fondamentale per LVGL
 
     tft_write_cmd(0xB2);  // Porch control
     tft_write_data(0x0C); tft_write_data(0x0C);
@@ -122,8 +89,8 @@ void tft_hardware_init() {
     sleep_ms(10);
 }
 
-void tft_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p) {
-    
+static void tft_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p) {
+
     tft_write_cmd(0x2A); // (X)
     tft_write_data(area->x1 >> 8); tft_write_data(area->x1 & 0xFF);
     tft_write_data(area->x2 >> 8); tft_write_data(area->x2 & 0xFF);
@@ -132,58 +99,50 @@ void tft_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *
     tft_write_data(area->y1 >> 8); tft_write_data(area->y1 & 0xFF);
     tft_write_data(area->y2 >> 8); tft_write_data(area->y2 & 0xFF);
 
-    tft_write_cmd(0x2C); 
+    tft_write_cmd(0x2C);
 
     uint32_t width = (area->x2 - area->x1 + 1);
     uint32_t height = (area->y2 - area->y1 + 1);
     uint32_t num_pixels = width * height;
-    
-    gpio_put(TFT_DC, 1); 
-    gpio_put(TFT_CS, 0); 
+
+    gpio_put(TFT_DC, 1);
+    gpio_put(TFT_CS, 0);
 
     spi_write_blocking(SPI_PORT, (uint8_t *)color_p, num_pixels * 2);
 
-    gpio_put(TFT_CS, 1); 
+    gpio_put(TFT_CS, 1);
 
     lv_disp_flush_ready(disp_drv);
 }
 
 //* Pumps init
-void init_pumps() {
-    gpio_init(PUMP_4);
-    gpio_init(PUMP_3);
-    gpio_init(PUMP_5);
-    gpio_init(PUMP_1);
-    gpio_init(PUMP_2);
-    gpio_init(PUMP_6);
-
-    gpio_set_dir(PUMP_4, GPIO_OUT);
-    gpio_set_dir(PUMP_3, GPIO_OUT);
-    gpio_set_dir(PUMP_5, GPIO_OUT);
-    gpio_set_dir(PUMP_1, GPIO_OUT);
-    gpio_set_dir(PUMP_2, GPIO_OUT);
-    gpio_set_dir(PUMP_6, GPIO_OUT);
+static void init_pumps() {
+    for(int i = 0; i < N_PUMPS; i++){
+        gpio_init(pump_pins[i]);
+        gpio_set_dir(pump_pins[i], GPIO_OUT);
+        gpio_put(pump_pins[i], 0); 
+    }
 }
 
 //* Carousel servo init
-void init_servo_motor() {
+static void init_servo_motor() {
     gpio_set_function(CAROUSEL_SERVO, GPIO_FUNC_PWM);
     slice   = pwm_gpio_to_slice_num(CAROUSEL_SERVO);
     channel = pwm_gpio_to_channel(CAROUSEL_SERVO);
 
-    pwm_set_clkdiv(slice, 100.0f);  
-    pwm_set_wrap(slice, 24999);     
+    pwm_set_clkdiv(slice, 100.0f);  //125 MHz / 100 = 1,25 MHz
+    pwm_set_wrap(slice, 24999);     //-> 50 Hz
     pwm_set_enabled(slice, true);
 }
 
 //* Button init
-void init_req_button() {
+static void init_req_button() {
     gpio_init(UNLOAD_BUTTON);
     gpio_set_dir(UNLOAD_BUTTON, GPIO_IN);
     gpio_pull_up(UNLOAD_BUTTON);
 }
 
-void init_distance_sensor() {
+static void init_distance_sensor() {
     gpio_init(DISTANCE_ECHO);
     gpio_set_dir(DISTANCE_ECHO, GPIO_IN);
 
@@ -193,7 +152,7 @@ void init_distance_sensor() {
 }
 
 //* Full system init
-void init_fluidsync() {
+void hw_init(void) {
     stdio_init_all();
     init_pumps();
     init_servo_motor();
@@ -204,21 +163,48 @@ void init_fluidsync() {
     init_distance_sensor();
 }
 
-float get_distance() {
-    
+//* Pumps
+void hw_pump_on(uint8_t pump_id){
+    gpio_put(pump_pins[pump_id], 1);
+}
+
+void hw_pump_off(uint8_t pump_id){
+    gpio_put(pump_pins[pump_id], 0);
+}
+
+void hw_all_pumps_off(void){
+    for(int i = 0; i < N_PUMPS; i++) gpio_put(pump_pins[i], 0);
+}
+
+//* Carousel
+static void carousel_set_position(uint index){
+    pwm_set_chan_level(slice, channel, carousel_positions[index]);
+    vTaskDelay(pdMS_TO_TICKS(SERVO_SETTLE_MS)); 
+}
+
+void hw_carousel_move_to_slot(int slot){
+    carousel_set_position(slot + 1); 
+}
+
+void hw_carousel_move_to_rest(void){
+    carousel_set_position(0);
+}
+
+//* Distance sensor
+static float get_distance() {
+
     gpio_put(DISTANCE_TRIG, 1);
     sleep_us(10);
     gpio_put(DISTANCE_TRIG, 0);
 
-    uint32_t timeout = time_us_32() + 30000; 
+    uint32_t t0 = time_us_32();
     while (gpio_get(DISTANCE_ECHO) == 0) {
-        if (time_us_32() > timeout) return -1.0f; 
+        if (time_us_32() - t0 > 30000) return -1.0f;
     }
     uint32_t start_time = time_us_32();
 
-    timeout = time_us_32() + 30000;
     while (gpio_get(DISTANCE_ECHO) == 1) {
-        if (time_us_32() > timeout) return -1.0f;
+        if (time_us_32() - start_time > 30000) return -1.0f;
     }
     uint32_t end_time = time_us_32();
 
@@ -227,19 +213,24 @@ float get_distance() {
     return (pulse_duration * 0.0343f) / 2.0f;
 }
 
+bool hw_cup_present(void){
+    float d = get_distance();
+    printf("distance: %f\n", d);
+    return d > 0.0f && d < CUP_MAX_DISTANCE_CM;
+}
 
-int main() {
-    init_fluidsync();
+//* Button
+bool hw_button_is_pressed(void){
+    return gpio_get(UNLOAD_BUTTON) == 0;
+}
 
-    gpio_put(PUMP_4, 0);
-    gpio_put(PUMP_3, 1);
-    gpio_put(PUMP_5, 0);
-    gpio_put(PUMP_1, 0);
-    gpio_put(PUMP_2, 0);
-    gpio_put(PUMP_6, 0); 
+//* Display
+static lv_obj_t *rect;
+static lv_obj_t *label;
 
+void hw_display_init(void){
     static lv_disp_draw_buf_t draw_buf;
-    static lv_color_t buf1[TFT_HOR_RES * 10]; 
+    static lv_color_t buf1[TFT_HOR_RES * 10];
     lv_disp_draw_buf_init(&draw_buf, buf1, NULL, TFT_HOR_RES * 10);
 
     static lv_disp_drv_t disp_drv;
@@ -250,46 +241,41 @@ int main() {
     disp_drv.ver_res = TFT_VER_RES;
     lv_disp_drv_register(&disp_drv);
 
-    lv_obj_t *rect = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(rect, 200, 100);                        
-    lv_obj_align(rect, LV_ALIGN_CENTER, 0, 0);               
+    rect = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(rect, 200, 100);
+    lv_obj_align(rect, LV_ALIGN_CENTER, 0, 0);
 
     static lv_style_t style_rect;
     lv_style_init(&style_rect);
-    lv_style_set_bg_color(&style_rect, lv_color_hex(0xFF0000)); 
-    lv_style_set_bg_opa(&style_rect, LV_OPA_COVER);             
-    lv_style_set_border_width(&style_rect, 0);                  
-    lv_style_set_radius(&style_rect, 0);                        
-
+    lv_style_set_bg_opa(&style_rect, LV_OPA_COVER);
+    lv_style_set_border_width(&style_rect, 0);
+    lv_style_set_radius(&style_rect, 0);
     lv_obj_add_style(rect, &style_rect, 0);
 
-    static uint servo_index = 0;
-    static absolute_time_t next_servo_time;
-    next_servo_time = make_timeout_time_ms(1000);
+    label = lv_label_create(rect);
+    lv_obj_center(label);
 
-    while (true) {
+    hw_display_set_state(UI_RUNNING);
+}
 
-        printf("distance: %f\n", get_distance());
-
-        lv_tick_inc(5);
-        lv_timer_handler();
-
-        if (absolute_time_diff_us(get_absolute_time(), next_servo_time) <= 0) {
-            pwm_set_chan_level(slice, channel, carousel_positions[servo_index]);
-            servo_index = (servo_index + 1) % 5;
-            next_servo_time = make_timeout_time_ms(1000);
-        }
-
-        bool current_state = gpio_get(UNLOAD_BUTTON);
-
-        if (!current_state) {
-            lv_obj_set_style_bg_color(rect, lv_color_hex(0x00FF00), LV_PART_MAIN);
-        }else{
-            lv_obj_set_style_bg_color(rect, lv_color_hex(0xFF0000), LV_PART_MAIN);
-        }
-
-        sleep_ms(5);
+void hw_display_set_state(ui_state_t state){
+    switch(state){
+        case UI_WAIT_MIX:
+            lv_obj_set_style_bg_color(rect, lv_color_hex(0xFFD000), LV_PART_MAIN); //giallo
+            lv_label_set_text(label, "ATTENDI FINE MIX");
+            break;
+        case UI_USER_TURN:
+            lv_obj_set_style_bg_color(rect, lv_color_hex(0x00FF00), LV_PART_MAIN); //verde
+            lv_label_set_text(label, "TOGLI I BICCHIERI\nE PREMI");
+            break;
+        default:
+            lv_obj_set_style_bg_color(rect, lv_color_hex(0x404040), LV_PART_MAIN); //grigio
+            lv_label_set_text(label, "IN FUNZIONE");
+            break;
     }
+}
 
-    return 0;
+void hw_display_tick(uint32_t elapsed_ms){
+    lv_tick_inc(elapsed_ms);
+    lv_timer_handler();
 }

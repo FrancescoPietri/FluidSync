@@ -38,7 +38,7 @@ include(${FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/RP2040/FreeRTOS_Kernel_i
 
 pico_sdk_init()
 
-add_executable(FluidSync FluidSync.c )
+add_executable(FluidSync FluidSync.c FluidSyncHW.c )
 
 add_subdirectory(lvgl)
 target_include_directories(lvgl PUBLIC ${CMAKE_CURRENT_LIST_DIR})
