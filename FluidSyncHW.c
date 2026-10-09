@@ -13,6 +13,14 @@
 
 static const uint pump_pins[N_PUMPS] = { PUMP_1, PUMP_2, PUMP_3, PUMP_4, PUMP_5, PUMP_6 };
 
+static const uint carousel_positions[CAROUSEL_CUPS_SLOTS + 1] = {
+    0,      //rest position to enable the user to take off the cups
+    625,    //cup 1
+    1250,   //cup 2
+    2125,   //cup 3
+    2819    //cup 4
+};
+
 static uint slice;
 static uint channel;
 

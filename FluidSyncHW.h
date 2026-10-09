@@ -18,13 +18,6 @@
 #define CAROUSEL_SERVO 8
 #define SERVO_SETTLE_MS 700 
 
-static const uint carousel_positions[CAROUSEL_CUPS_SLOTS + 1] = {
-    0,      //rest position to enable the user to take off the cups
-    625,    //cup 1
-    1250,   //cup 2
-    2125,   //cup 3
-    2819    //cup 4
-};
 
 //* Distance Sensor Pin
 #define DISTANCE_ECHO 7

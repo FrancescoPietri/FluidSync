@@ -13,22 +13,20 @@
 #include "queue.h"
 #include "pico/rand.h"
 
+#include "FluidSyncHW.h"
+
 //order arrival interval
 #define ORDER_MIN_INTERVAL_MS 5000
 #define ORDER_MAX_INTERVAL_MS 30000
-#define USER_BUTTON_GPIO   9
 #define BUTTON_POLL_MS     10
 #define BUTTON_DEBOUNCE_MS 30
 
+#define DISPLAY_PERIOD_MS 5
+int ui_state;
 
 #define N_MAX_ORDER 10
 
 #define TIME_PER_PERCENT_MS 429 //for each 1% the pump must go for 429ms, each mix is 100ml
-
-//* Servo Motor Pin
-#define CAROUSEL_SERVO 8
-#define CAROUSEL_CUPS_SLOTS 4
-#define N_PUMPS 6
 
 //define core affinity
 #define CORE_0 (1 << 0)
@@ -170,11 +168,13 @@ void pump_worker_task1C(void *pvParameters) { //single thread of a pump, pumps m
     while(1) {
         if (xQueueReceive(order_manager.pump_queue, &job, portMAX_DELAY) == pdPASS) {
 
+            hw_pump_on(job.pump_id);
             printf("    PUMP %d STARTED\n", job.pump_id);
 
             uint32_t delay_ms = job.percentage * TIME_PER_PERCENT_MS;
             vTaskDelay(pdMS_TO_TICKS(delay_ms));
 
+            hw_pump_off(job.pump_id);
             printf("    PUMP %d STOPPED\n", job.pump_id);
 
             xSemaphoreGive(order_manager.mix_done_sem);
@@ -251,7 +251,6 @@ void carousel_task1B(void *pvParameters){
                 carousel_manager.bl_cr--;
             }
             for(int i=0; i<CAROUSEL_CUPS_SLOTS; i++){
-                //move to slot i
                 switch(carousel_manager.carousel_slot[i]){
                     case 0:
                         carousel_manager.current_ready_slot=i;
@@ -259,7 +258,8 @@ void carousel_task1B(void *pvParameters){
                     case 1:
                         break;
                     case 2:
-                        if((rand()%20)<15){
+                        hw_carousel_move_to_slot(i);
+                        if(hw_cup_present()){
                             carousel_manager.carousel_slot[i]=0;
                             carousel_manager.n_ready_slot++;
                             carousel_manager.n_not_ready_slot--;
@@ -269,7 +269,8 @@ void carousel_task1B(void *pvParameters){
             }
         }while(carousel_manager.n_ready_slot==0);
         //move to last noted ready slot and wakeup pumps manager
-        printf("MOVING TO SLOT %d",  carousel_manager.current_ready_slot);
+        printf("MOVING TO SLOT %d\n",  carousel_manager.current_ready_slot);
+        hw_carousel_move_to_slot(carousel_manager.current_ready_slot);
         order_manager.erogating = true; //protetto da carousel_mux: da qui l'utente aspetta la fine del mix
         xSemaphoreGive(carousel_manager.carousel_mux);
         xSemaphoreGive(order_manager.calibration_sem);
@@ -282,7 +283,6 @@ static uint32_t pausetta(unsigned int *seed, uint32_t min, uint32_t max){
 
 void orders_task0A(void *pvParameters){
     unsigned int seed = get_rand_32();
-    uint32_t order_id = 0;
 
     while(1){
         vTaskDelay(pdMS_TO_TICKS(pausetta(&seed, ORDER_MIN_INTERVAL_MS, ORDER_MAX_INTERVAL_MS)));
@@ -304,7 +304,7 @@ void orders_task0A(void *pvParameters){
 }
 
 static bool button_is_pressed(void){
-    return gpio_get(USER_BUTTON_GPIO) == 0;
+    return hw_button_is_pressed();
 }
 
 static void wait_button_click(void){
@@ -326,6 +326,7 @@ void user_button0B(void *pvParameters){
         xSemaphoreTake(carousel_manager.carousel_mux, portMAX_DELAY);
         if(order_manager.erogating){
             order_manager.bl_user++;
+            ui_state = UI_WAIT_MIX;
             xSemaphoreGive(carousel_manager.carousel_mux);
             xSemaphoreTake(order_manager.button_sem, portMAX_DELAY);
             //token passing from task1A to task0B of carousel mux
@@ -343,9 +344,13 @@ void user_button0B(void *pvParameters){
         carousel_manager.n_not_ready_slot=CAROUSEL_CUPS_SLOTS;
         carousel_manager.current_ready_slot=-1;
 
+        hw_carousel_move_to_rest();
+        ui_state = UI_USER_TURN;
+
         printf("USER USING CAROUSEL \n");
 
         wait_button_click();
+        ui_state = UI_RUNNING;
 
         if(carousel_manager.bl_cr>0){
             xSemaphoreGive(carousel_manager.user_action_sem);
@@ -358,27 +363,36 @@ void user_button0B(void *pvParameters){
     }
 }
 
-int main() {
-    stdio_init_all();
-    srand(time(NULL));
+void display_task0D(void *pvParameters){
+    ui_state_t shown = UI_RUNNING;
+    while(1){
+        ui_state_t now = ui_state;
+        if(now != shown){
+            hw_display_set_state(now);
+            shown = now;
+        }
+        hw_display_tick(DISPLAY_PERIOD_MS);
+        vTaskDelay(pdMS_TO_TICKS(DISPLAY_PERIOD_MS));
+    }
+}
 
-    gpio_init(USER_BUTTON_GPIO);
-    gpio_set_dir(USER_BUTTON_GPIO, GPIO_IN);
-    gpio_pull_up(USER_BUTTON_GPIO);
+
+int main() {
+    hw_init();
+    hw_display_init();
 
     carousel_manager_init();
     order_manager_init();
-    //pumps_hardware_init();
 
     xTaskCreateAffinitySet(pumps_task1A, "Pump_Manager", 512, NULL, 3, CORE_1, NULL);
     xTaskCreateAffinitySet(carousel_task1B, "Carousel_Manager", 512, NULL, 3, CORE_1, NULL);
 
-    xTaskCreateAffinitySet(pump_worker_task1C, "Worker_1", 256, NULL, 2, CORE_1, NULL);
-    xTaskCreateAffinitySet(pump_worker_task1C, "Worker_2", 256, NULL, 2, CORE_1, NULL);
+    xTaskCreateAffinitySet(pump_worker_task1C, "Worker_1", 256, NULL, 4, CORE_1, NULL);
+    xTaskCreateAffinitySet(pump_worker_task1C, "Worker_2", 256, NULL, 4, CORE_1, NULL);
 
-    xTaskCreateAffinitySet(orders_task0A, "Order_Generator", 256, NULL, 3, CORE_0, NULL);
-    xTaskCreateAffinitySet(user_button0B, "User_Action", 256, NULL, 2, CORE_0, NULL);
-
+    xTaskCreateAffinitySet(orders_task0A, "Order_Generator", 512, NULL, 3, CORE_0, NULL);
+    xTaskCreateAffinitySet(user_button0B, "User_Action", 512, NULL, 4, CORE_0, NULL);
+    xTaskCreateAffinitySet(display_task0D, "Display", 2048, NULL, 2, CORE_0, NULL);
 
     vTaskStartScheduler();
 
