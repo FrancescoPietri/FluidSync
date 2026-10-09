@@ -14,6 +14,7 @@
 #include "pico/rand.h"
 
 #include "FluidSyncHW.h"
+#include "FluidSyncUI.h"
 
 //order arrival interval
 #define ORDER_MIN_INTERVAL_MS 5000
@@ -169,13 +170,13 @@ void pump_worker_task1C(void *pvParameters) { //single thread of a pump, pumps m
         if (xQueueReceive(order_manager.pump_queue, &job, portMAX_DELAY) == pdPASS) {
 
             hw_pump_on(job.pump_id);
-            printf("    PUMP %d STARTED\n", job.pump_id);
+            printf("    PUMP %d STARTED\n", job.pump_id+1);
 
             uint32_t delay_ms = job.percentage * TIME_PER_PERCENT_MS;
             vTaskDelay(pdMS_TO_TICKS(delay_ms));
 
             hw_pump_off(job.pump_id);
-            printf("    PUMP %d STOPPED\n", job.pump_id);
+            printf("    PUMP %d STOPPED\n", job.pump_id+1);
 
             xSemaphoreGive(order_manager.mix_done_sem);
         }
@@ -226,7 +227,7 @@ void pumps_task1A(void *pvParameters){
         carousel_manager.n_filled_slot++;
         order_manager.erogating = false;
 
-        printf("MIX READY IN SLOT %d!\n", carousel_manager.current_ready_slot);
+        printf("MIX READY IN SLOT %d!\n", carousel_manager.current_ready_slot+1);
 
         //if a user is waiting for a mix to finish i want that his request is served next.
         if(order_manager.bl_user>0){
@@ -245,6 +246,7 @@ void carousel_task1B(void *pvParameters){
         do{
             if(carousel_manager.n_ready_slot==0){
                 carousel_manager.bl_cr++;
+                ui_state = UI_NO_CUPS;
                 xSemaphoreGive(carousel_manager.carousel_mux);
                 xSemaphoreTake(carousel_manager.user_action_sem, portMAX_DELAY); //si mette in attesa che l'utente scarichi il carosello
                 //token passing da taskC.0
@@ -269,7 +271,7 @@ void carousel_task1B(void *pvParameters){
             }
         }while(carousel_manager.n_ready_slot==0);
         //move to last noted ready slot and wakeup pumps manager
-        printf("MOVING TO SLOT %d\n",  carousel_manager.current_ready_slot);
+        printf("MOVING TO SLOT %d\n",  carousel_manager.current_ready_slot+1);
         hw_carousel_move_to_slot(carousel_manager.current_ready_slot);
         order_manager.erogating = true; //protetto da carousel_mux: da qui l'utente aspetta la fine del mix
         xSemaphoreGive(carousel_manager.carousel_mux);
@@ -363,16 +365,75 @@ void user_button0B(void *pvParameters){
     }
 }
 
+#define UI_REFRESH_MS 100
+
 void display_task0D(void *pvParameters){
-    ui_state_t shown = UI_RUNNING;
+    ui_snapshot_t s = {0};
+    bool was_on[N_PUMPS] = {false};
+    bool mix_known = false;       //mix of the current erogation already read
+    bool was_erogating = false;
+    uint32_t mixes_done = 0;      //counted here: every end of an erogation is a finished mix
+    uint32_t since_refresh = UI_REFRESH_MS;
+
     while(1){
-        ui_state_t now = ui_state;
-        if(now != shown){
-            hw_display_set_state(now);
-            shown = now;
+        if(since_refresh >= UI_REFRESH_MS){
+            since_refresh = 0;
+            bool erogating = order_manager.erogating;
+
+            //new erogation: the mix is not known yet (it is popped only after the carousel is in position)
+            if(erogating && !was_erogating){
+                mix_known = false;
+                for(int i = 0; i < N_PUMPS; i++){ s.mix_pct[i] = 0; s.pump_state[i] = UI_PUMP_UNUSED; was_on[i] = false; }
+            }
+            if(!erogating && was_erogating) mixes_done++;
+            was_erogating = erogating;
+
+            bool any_on = false;
+            for(int i = 0; i < N_PUMPS; i++) if(hw_pump_is_on(i, NULL)) any_on = true;
+
+            //first pump on: pumps_task1A has already popped the mix, it is the slot just before order_tail
+            if(erogating && !mix_known && any_on){
+                const mix *m = &order_manager.order_queue[(order_manager.order_tail + N_MAX_ORDER - 1) % N_MAX_ORDER];
+                for(int i = 0; i < N_PUMPS; i++){
+                    s.mix_pct[i] = m->pump_output[i];
+                    s.pump_state[i] = m->pump_output[i] > 0 ? UI_PUMP_WAITING : UI_PUMP_UNUSED;
+                }
+                mix_known = true;
+            }
+
+            //pump states and progress, from the pump GPIOs
+            uint32_t total = 0, poured = 0;
+            for(int i = 0; i < N_PUMPS; i++){
+                uint32_t on_ms;
+                bool on = hw_pump_is_on(i, &on_ms);
+                if(mix_known && s.mix_pct[i] > 0){
+                    if(on) s.pump_state[i] = UI_PUMP_RUNNING;
+                    else if(was_on[i]) s.pump_state[i] = UI_PUMP_DONE;
+                }
+                was_on[i] = was_on[i] || on;
+
+                total += s.mix_pct[i];
+                if(s.pump_state[i] == UI_PUMP_DONE) poured += s.mix_pct[i];
+                else if(s.pump_state[i] == UI_PUMP_RUNNING){
+                    uint32_t p = on_ms / TIME_PER_PERCENT_MS;
+                    poured += p < s.mix_pct[i] ? p : s.mix_pct[i];
+                }
+            }
+            s.fill_pct = total ? poured * 100 / total : 0;
+
+            s.state = (ui_state_t)ui_state;
+            s.dispensing = erogating;
+            s.active_slot = carousel_manager.current_ready_slot;
+            for(int i = 0; i < CAROUSEL_CUPS_SLOTS; i++) s.slot[i] = carousel_manager.carousel_slot[i];
+            s.queue_len = order_manager.order_counter;
+            s.queue_max = N_MAX_ORDER;
+            s.mixes_done = mixes_done;
+
+            ui_update(&s);
         }
         hw_display_tick(DISPLAY_PERIOD_MS);
         vTaskDelay(pdMS_TO_TICKS(DISPLAY_PERIOD_MS));
+        since_refresh += DISPLAY_PERIOD_MS;
     }
 }
 

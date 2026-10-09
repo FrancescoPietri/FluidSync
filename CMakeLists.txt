@@ -38,7 +38,7 @@ include(${FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/RP2040/FreeRTOS_Kernel_i
 
 pico_sdk_init()
 
-add_executable(FluidSync FluidSync.c FluidSyncHW.c )
+add_executable(FluidSync FluidSync.c FluidSyncHW.c FluidSyncUI.c)
 
 add_subdirectory(lvgl)
 target_include_directories(lvgl PUBLIC ${CMAKE_CURRENT_LIST_DIR})
@@ -66,5 +66,7 @@ target_link_libraries(FluidSync PRIVATE
         hardware_spi
         hardware_timer
 )
+
+pico_enable_stdio_usb(FluidSync 1)
 
 pico_add_extra_outputs(FluidSync)

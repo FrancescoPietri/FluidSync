@@ -17,7 +17,10 @@
 //* Carousel Motor Pin
 #define CAROUSEL_SERVO 8
 #define SERVO_SETTLE_MS 700 
-
+#define SENSOR_SETTLE_MS   100 //extra wait after the servo, the carousel stops vibrating
+#define SENSOR_READINGS    5
+#define SENSOR_GAP_MS      60  //min time between two pings
+#define SENSOR_MIN_VALID   3   //less valid readings than this -> no cup
 
 //* Distance Sensor Pin
 #define DISTANCE_ECHO 7
@@ -34,16 +37,10 @@
 #define TFT_DC 21
 #define TFT_CS 22
 #define SPI_PORT spi0
-#define TFT_HOR_RES 240
-#define TFT_VER_RES 320
+#define TFT_HOR_RES 320 //landscape: long side horizontal
+#define TFT_VER_RES 240
 
 
-//Status of machine
-typedef enum {
-    UI_RUNNING = 0,   //machine running
-    UI_WAIT_MIX,      //user waiting for the mix to finish, user should not touch carousel in this phase
-    UI_USER_TURN      //ok user can perform action
-} ui_state_t;
 
 void hw_init(void);
 
@@ -51,6 +48,8 @@ void hw_init(void);
 void hw_pump_on(uint8_t pump_id);
 void hw_pump_off(uint8_t pump_id);
 void hw_all_pumps_off(void);
+//true if the pump is on; *on_ms (if not NULL) = how long it has been on. Read-only, for the display
+bool hw_pump_is_on(uint8_t pump_id, uint32_t *on_ms);
 
 void hw_carousel_move_to_slot(int slot); //slot 0..3
 void hw_carousel_move_to_rest(void);     
@@ -60,6 +59,6 @@ bool hw_cup_present(void);
 
 bool hw_button_is_pressed(void);
 
+//display: call ONLY from the display task (LVGL is not thread-safe). The screen itself is in FluidSyncUI.c
 void hw_display_init(void);
-void hw_display_set_state(ui_state_t state);
 void hw_display_tick(uint32_t elapsed_ms);

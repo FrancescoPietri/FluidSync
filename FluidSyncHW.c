@@ -10,15 +10,16 @@
 #include "task.h"
 
 #include "FluidSyncHW.h"
+#include "FluidSyncUI.h"
 
 static const uint pump_pins[N_PUMPS] = { PUMP_1, PUMP_2, PUMP_3, PUMP_4, PUMP_5, PUMP_6 };
 
 static const uint carousel_positions[CAROUSEL_CUPS_SLOTS + 1] = {
     0,      //rest position to enable the user to take off the cups
-    625,    //cup 1
-    1250,   //cup 2
-    2125,   //cup 3
-    2819    //cup 4
+    615,    //cup 1
+    1300,   //cup 2
+    2085,   //cup 3
+    2860    //cup 4
 };
 
 static uint slice;
@@ -60,7 +61,7 @@ static void tft_hardware_init() {
     sleep_ms(120);
 
     tft_write_cmd(0x36);  // MADCTL - orientamento e ordine RGB
-    tft_write_data(0x00); // Portrait, RGB
+    tft_write_data(0x60); // Landscape (MV|MX), RGB. Upside down? use 0xA0. Mirrored? use 0x20 or 0xE0
 
     tft_write_cmd(0x3A);  // COLMOD - pixel format
     tft_write_data(0x55); // 16 bit / pixel (RGB565) <- fondamentale per LVGL
@@ -78,8 +79,8 @@ static void tft_hardware_init() {
     tft_write_cmd(0xC0);  // LCM control
     tft_write_data(0x2C);
 
-    tft_write_cmd(0xC2);  // VDV/VRH enable
-    tft_write_data(0x01);
+    tft_write_cmd(0x36);  // VDV/VRH enable
+    tft_write_data(0xA0);
 
     tft_write_cmd(0xC3);  // VRH set
     tft_write_data(0x12);
@@ -172,16 +173,28 @@ void hw_init(void) {
 }
 
 //* Pumps
+static volatile bool pump_is_on[N_PUMPS];
+static volatile uint32_t pump_on_since_ms[N_PUMPS];
+
 void hw_pump_on(uint8_t pump_id){
+    pump_on_since_ms[pump_id] = to_ms_since_boot(get_absolute_time());
+    pump_is_on[pump_id] = true;
     gpio_put(pump_pins[pump_id], 1);
 }
 
 void hw_pump_off(uint8_t pump_id){
     gpio_put(pump_pins[pump_id], 0);
+    pump_is_on[pump_id] = false;
+}
+
+bool hw_pump_is_on(uint8_t pump_id, uint32_t *on_ms){
+    bool on = pump_is_on[pump_id];
+    if (on_ms) *on_ms = on ? to_ms_since_boot(get_absolute_time()) - pump_on_since_ms[pump_id] : 0;
+    return on;
 }
 
 void hw_all_pumps_off(void){
-    for(int i = 0; i < N_PUMPS; i++) gpio_put(pump_pins[i], 0);
+    for(int i = 0; i < N_PUMPS; i++) hw_pump_off(i);
 }
 
 //* Carousel
@@ -200,6 +213,12 @@ void hw_carousel_move_to_rest(void){
 
 //* Distance sensor
 static float get_distance() {
+
+    //ECHO must be low before a new ping (the previous echo may still be in progress)
+    uint32_t t_idle = time_us_32();
+    while (gpio_get(DISTANCE_ECHO) == 1) {
+        if (time_us_32() - t_idle > 30000) return -1.0f;
+    }
 
     gpio_put(DISTANCE_TRIG, 1);
     sleep_us(10);
@@ -222,9 +241,31 @@ static float get_distance() {
 }
 
 bool hw_cup_present(void){
-    float d = get_distance();
-    printf("distance: %f\n", d);
-    return d > 0.0f && d < CUP_MAX_DISTANCE_CM;
+    float d[SENSOR_READINGS];
+    int n = 0;
+
+    vTaskDelay(pdMS_TO_TICKS(SENSOR_SETTLE_MS));
+    for (int i = 0; i < SENSOR_READINGS; i++) {
+        float x = get_distance();
+        if (x > 0.0f) d[n++] = x; //-1 = timeout, discarded
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_GAP_MS)); //the task blocks, the others run
+    }
+
+    if (n < SENSOR_MIN_VALID) {
+        printf("distance: no echo (%d/%d valid)\n", n, SENSOR_READINGS);
+        return false;
+    }
+
+    //insertion sort, then take the middle value
+    for (int i = 1; i < n; i++) {
+        float v = d[i];
+        int j = i - 1;
+        while (j >= 0 && d[j] > v) { d[j + 1] = d[j]; j--; }
+        d[j + 1] = v;
+    }
+    float median = d[n / 2];
+    printf("distance: %.1f cm (median of %d)\n", median, n);
+    return median < CUP_MAX_DISTANCE_CM;
 }
 
 //* Button
@@ -233,9 +274,6 @@ bool hw_button_is_pressed(void){
 }
 
 //* Display
-static lv_obj_t *rect;
-static lv_obj_t *label;
-
 void hw_display_init(void){
     static lv_disp_draw_buf_t draw_buf;
     static lv_color_t buf1[TFT_HOR_RES * 10];
@@ -249,38 +287,7 @@ void hw_display_init(void){
     disp_drv.ver_res = TFT_VER_RES;
     lv_disp_drv_register(&disp_drv);
 
-    rect = lv_obj_create(lv_scr_act());
-    lv_obj_set_size(rect, 200, 100);
-    lv_obj_align(rect, LV_ALIGN_CENTER, 0, 0);
-
-    static lv_style_t style_rect;
-    lv_style_init(&style_rect);
-    lv_style_set_bg_opa(&style_rect, LV_OPA_COVER);
-    lv_style_set_border_width(&style_rect, 0);
-    lv_style_set_radius(&style_rect, 0);
-    lv_obj_add_style(rect, &style_rect, 0);
-
-    label = lv_label_create(rect);
-    lv_obj_center(label);
-
-    hw_display_set_state(UI_RUNNING);
-}
-
-void hw_display_set_state(ui_state_t state){
-    switch(state){
-        case UI_WAIT_MIX:
-            lv_obj_set_style_bg_color(rect, lv_color_hex(0xFFD000), LV_PART_MAIN); //giallo
-            lv_label_set_text(label, "ATTENDI FINE MIX");
-            break;
-        case UI_USER_TURN:
-            lv_obj_set_style_bg_color(rect, lv_color_hex(0x00FF00), LV_PART_MAIN); //verde
-            lv_label_set_text(label, "TOGLI I BICCHIERI\nE PREMI");
-            break;
-        default:
-            lv_obj_set_style_bg_color(rect, lv_color_hex(0x404040), LV_PART_MAIN); //grigio
-            lv_label_set_text(label, "IN FUNZIONE");
-            break;
-    }
+    ui_create(); //screen layout in FluidSyncUI.c
 }
 
 void hw_display_tick(uint32_t elapsed_ms){
