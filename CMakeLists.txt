@@ -57,6 +57,7 @@ target_include_directories(FluidSync PRIVATE
 
 target_link_libraries(FluidSync PRIVATE
         pico_stdlib
+        pico_rand
         FreeRTOS-Kernel
         FreeRTOS-Kernel-Heap4
         pico_cyw43_arch_none
