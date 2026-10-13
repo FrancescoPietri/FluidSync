@@ -331,11 +331,11 @@ void user_button_task0B(void *pvParameters){
     {
         wait_button_click();
 
+        ui_state = UI_WAIT_MIX;
         xSemaphoreTake(carousel_manager.carousel_mux, portMAX_DELAY);
 
         if(order_manager.erogating){ //if an order is been erogated we cant access the carousel.
             order_manager.bl_user++;
-            ui_state = UI_WAIT_MIX;
             xSemaphoreGive(carousel_manager.carousel_mux);
             xSemaphoreTake(order_manager.button_sem, portMAX_DELAY);
             //token passing from task1A to task0B of carousel mux
