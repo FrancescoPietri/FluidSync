@@ -1,2 +1,0 @@
-Perilstaltic pump current usage: 330mA (picco iniziale a 500mA)
-Portata 140 ml/min
