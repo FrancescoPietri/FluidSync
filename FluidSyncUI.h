@@ -9,6 +9,8 @@
 
 #include "FluidSyncHW.h" //N_PUMPS, CAROUSEL_CUPS_SLOTS
 
+#define UI_REFRESH_MS 100
+
 //Status of machine, chosen by the logic
 typedef enum {
     UI_RUNNING = 0,   //machine running, nothing to do for the user

@@ -18,7 +18,7 @@
 #define CAROUSEL_SERVO 8
 #define SERVO_SETTLE_MS 700 
 #define SENSOR_SETTLE_MS   100 
-#define SENSOR_READINGS    5
+#define SENSOR_READINGS    8
 #define SENSOR_GAP_MS      60  
 #define SENSOR_MIN_VALID   3   
 
@@ -29,6 +29,8 @@
 
 //* Button Pin
 #define UNLOAD_BUTTON 9
+#define BUTTON_POLL_MS     50
+#define BUTTON_DEBOUNCE_MS 30
 
 //* TFT Display Pins
 #define TFT_SDA 18
@@ -39,6 +41,8 @@
 #define SPI_PORT spi0
 #define TFT_HOR_RES 320 //landscape: long side horizontal
 #define TFT_VER_RES 240
+#define DISPLAY_PERIOD_MS 30
+
 
 
 void hw_init(void);

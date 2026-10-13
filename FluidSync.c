@@ -19,21 +19,16 @@
 //order arrival interval
 #define ORDER_MIN_INTERVAL_MS 5000
 #define ORDER_MAX_INTERVAL_MS 30000
-#define BUTTON_POLL_MS     50
-#define BUTTON_DEBOUNCE_MS 30
-
-#define DISPLAY_PERIOD_MS 30
-int ui_state;
 
 #define N_MAX_ORDER 10
 
 #define TIME_PER_PERCENT_MS 429 //for each 1% the pump must go for 429ms, each mix is 100ml
 
-#define UI_REFRESH_MS 100
-
 //define core affinity
 #define CORE_0 (1 << 0)
 #define CORE_1 (1 << 1)
+
+int ui_state;
 
 enum liquid_t {
     LIQ_YELLOW  = 0,  
