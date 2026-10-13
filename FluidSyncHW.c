@@ -16,10 +16,10 @@ static const uint pump_pins[N_PUMPS] = { PUMP_1, PUMP_2, PUMP_3, PUMP_4, PUMP_5,
 
 static const uint carousel_positions[CAROUSEL_CUPS_SLOTS + 1] = {
     0,      //rest position to enable the user to take off the cups
-    615,    //cup 1
-    1300,   //cup 2
-    2085,   //cup 3
-    2860    //cup 4
+    915,    //cup 1
+    1646,   //cup 2
+    2390,   //cup 3
+    3130    //cup 4
 };
 
 static uint slice;
@@ -142,6 +142,10 @@ static void init_servo_motor() {
     pwm_set_clkdiv(slice, 100.0f);  //125 MHz / 100 = 1,25 MHz
     pwm_set_wrap(slice, 24999);     //-> 50 Hz
     pwm_set_enabled(slice, true);
+}
+
+void hw_carousel_release(void){
+    pwm_set_chan_level(slice, channel, 0); //no pulse -> servo goes limp
 }
 
 //* Button init

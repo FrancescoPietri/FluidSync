@@ -17,15 +17,15 @@
 //* Carousel Motor Pin
 #define CAROUSEL_SERVO 8
 #define SERVO_SETTLE_MS 700 
-#define SENSOR_SETTLE_MS   100 //extra wait after the servo, the carousel stops vibrating
+#define SENSOR_SETTLE_MS   100 
 #define SENSOR_READINGS    5
-#define SENSOR_GAP_MS      60  //min time between two pings
-#define SENSOR_MIN_VALID   3   //less valid readings than this -> no cup
+#define SENSOR_GAP_MS      60  
+#define SENSOR_MIN_VALID   3   
 
 //* Distance Sensor Pin
 #define DISTANCE_ECHO 7
 #define DISTANCE_TRIG 6
-#define CUP_MAX_DISTANCE_CM 15.0f 
+#define CUP_MAX_DISTANCE_CM 9.0f 
 
 //* Button Pin
 #define UNLOAD_BUTTON 9
@@ -41,7 +41,6 @@
 #define TFT_VER_RES 240
 
 
-
 void hw_init(void);
 
 //pompe: id 0..5 = PUMP_1..PUMP_6 = yellow, magenta, cyan, white, black, water
@@ -53,6 +52,7 @@ bool hw_pump_is_on(uint8_t pump_id, uint32_t *on_ms);
 
 void hw_carousel_move_to_slot(int slot); //slot 0..3
 void hw_carousel_move_to_rest(void);     
+void hw_carousel_release(void);  
 
 //check if a cup is present, based on ultrasonic sensor, distance < 15
 bool hw_cup_present(void);

@@ -19,15 +19,17 @@
 //order arrival interval
 #define ORDER_MIN_INTERVAL_MS 5000
 #define ORDER_MAX_INTERVAL_MS 30000
-#define BUTTON_POLL_MS     10
+#define BUTTON_POLL_MS     50
 #define BUTTON_DEBOUNCE_MS 30
 
-#define DISPLAY_PERIOD_MS 5
+#define DISPLAY_PERIOD_MS 30
 int ui_state;
 
 #define N_MAX_ORDER 10
 
 #define TIME_PER_PERCENT_MS 429 //for each 1% the pump must go for 429ms, each mix is 100ml
+
+#define UI_REFRESH_MS 100
 
 //define core affinity
 #define CORE_0 (1 << 0)
@@ -43,8 +45,8 @@ enum liquid_t {
 };
 
 typedef struct { //define the components of a single mix
-    uint n_components; 
-    uint pump_output[N_PUMPS]; //define if a pump needs to be activated and the percentage of liquid
+    int n_components; 
+    int pump_output[N_PUMPS]; //define if a pump needs to be activated and the percentage of liquid
 } mix;
 
 #define N_TEST_MIXES 6
@@ -59,13 +61,13 @@ static const mix test_mixes[N_TEST_MIXES] = {
 
 
 typedef struct { //define a single pump job
-    uint8_t pump_id;
-    uint16_t percentage;
+    int pump_id;
+    int percentage;
 } pump_job_t;
 
 struct output_carousel_t { //struct to manage the status of the output carousel
 
-    int carousel_slot[CAROUSEL_CUPS_SLOTS]; //0=ready; 1=full; 2=not ready->no cup in the slot
+    int carousel_slot[CAROUSEL_CUPS_SLOTS]; //0=ready; 1=full; 2=not ready->no cup in the slot; 3=empty slot 
     int n_filled_slot;
     int n_ready_slot;
     int n_not_ready_slot;
@@ -78,15 +80,13 @@ struct output_carousel_t { //struct to manage the status of the output carousel
 
 }carousel_manager;
 
-struct order_c_buffer{ //struct to manage the order of mixes using a classic circular buffer
+struct order_c_buffer{ //struct to manage the order of mixes using a circular buffer
 
     mix order_queue[N_MAX_ORDER];
     int order_head;
     int order_tail;
     int order_counter;
 
-
-    bool order_wait_user_action;        //if the user is taking action on the carousel the machine must stop, no order can be erogated
     int bl_out;                         //signal if task1A output is waiting for a new order
     int bl_user;                        //signal if task1A is waiting for user action
     bool erogating;                     //signal if a mix is been erogated
@@ -139,7 +139,6 @@ void order_manager_init() {
 
     order_manager.order_counter = order_manager.order_head = order_manager.order_tail =0;
 
-    order_manager.order_wait_user_action = false;
     order_manager.erogating = false;
 }
 
@@ -172,7 +171,7 @@ void pump_worker_task1C(void *pvParameters) { //single thread of a pump, pumps m
             hw_pump_on(job.pump_id);
             printf("    PUMP %d STARTED\n", job.pump_id+1);
 
-            uint32_t delay_ms = job.percentage * TIME_PER_PERCENT_MS;
+            int delay_ms = job.percentage * TIME_PER_PERCENT_MS;
             vTaskDelay(pdMS_TO_TICKS(delay_ms));
 
             hw_pump_off(job.pump_id);
@@ -183,7 +182,7 @@ void pump_worker_task1C(void *pvParameters) { //single thread of a pump, pumps m
     }
 }
 
-void pumps_task1A(void *pvParameters){
+void dispenser_task1A(void *pvParameters){
     while(1){
 
         //check if we have new orders
@@ -244,7 +243,7 @@ void carousel_task1B(void *pvParameters){
         xSemaphoreTake(carousel_manager.carousel_sem, portMAX_DELAY); //si mette in attesa di ricere istruzioni da parte di pumps_manager
         xSemaphoreTake(carousel_manager.carousel_mux, portMAX_DELAY);
         do{
-            if(carousel_manager.n_ready_slot==0){
+            if(carousel_manager.n_ready_slot==0 && carousel_manager.current_ready_slot!=-1){
                 carousel_manager.bl_cr++;
                 ui_state = UI_NO_CUPS;
                 xSemaphoreGive(carousel_manager.carousel_mux);
@@ -252,6 +251,7 @@ void carousel_task1B(void *pvParameters){
                 //token passing da taskC.0
                 carousel_manager.bl_cr--;
             }
+            carousel_manager.current_ready_slot=0;
             for(int i=0; i<CAROUSEL_CUPS_SLOTS; i++){
                 switch(carousel_manager.carousel_slot[i]){
                     case 0:
@@ -266,36 +266,41 @@ void carousel_task1B(void *pvParameters){
                             carousel_manager.n_ready_slot++;
                             carousel_manager.n_not_ready_slot--;
                             carousel_manager.current_ready_slot=i;
+                        }else{
+                            carousel_manager.carousel_slot[i]=3;
                         }
+                        break;
+                    case 3:
+                        break;
                 }
             }
         }while(carousel_manager.n_ready_slot==0);
         //move to last noted ready slot and wakeup pumps manager
         printf("MOVING TO SLOT %d\n",  carousel_manager.current_ready_slot+1);
         hw_carousel_move_to_slot(carousel_manager.current_ready_slot);
-        order_manager.erogating = true; //protetto da carousel_mux: da qui l'utente aspetta la fine del mix
+        order_manager.erogating = true; //user must wait the end of erogation before accessing the carousel
         xSemaphoreGive(carousel_manager.carousel_mux);
         xSemaphoreGive(order_manager.calibration_sem);
     }
 }
 
-static uint32_t pausetta(unsigned int *seed, uint32_t min, uint32_t max){
-    return min + (uint32_t)rand_r(seed) % (max - min + 1);
+static int random_delay(unsigned int *seed, int min, int max){
+    return min + (int)rand_r(seed) % (max - min + 1);
 }
 
-void orders_task0A(void *pvParameters){
-    unsigned int seed = get_rand_32();
+void orders_task0A(void *pvParameters){ //generate orders at random intervals
+    int seed = get_rand_32();
 
     while(1){
-        vTaskDelay(pdMS_TO_TICKS(pausetta(&seed, ORDER_MIN_INTERVAL_MS, ORDER_MAX_INTERVAL_MS)));
+        vTaskDelay(pdMS_TO_TICKS(random_delay(&seed, ORDER_MIN_INTERVAL_MS, ORDER_MAX_INTERVAL_MS)));
         xSemaphoreTake(order_manager.order_mux, portMAX_DELAY);
-        uint8_t rand_mix = (uint8_t)rand_r(&seed) % (N_TEST_MIXES);
+        int rand_mix = (int)rand_r(&seed) % (N_TEST_MIXES);
 
         if(push_order(test_mixes[rand_mix])){
             printf("ORDER PUSHED \n");
             if(order_manager.bl_out>0){
                 order_manager.bl_out--;
-                xSemaphoreGive(order_manager.order_sem); //segnalo l'arrivo di un nuovo ordine
+                xSemaphoreGive(order_manager.order_sem); //wakes up task dispenser that is waiting for a new order
             }
         }else{
             printf("ORDER QUEUE FULL \n");
@@ -305,28 +310,30 @@ void orders_task0A(void *pvParameters){
     }
 }
 
-static bool button_is_pressed(void){
-    return hw_button_is_pressed();
-}
-
 static void wait_button_click(void){
     while(1){
-        while(!button_is_pressed()) vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
+        while(!hw_button_is_pressed()){
+            vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
+        }
         vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
-        if(button_is_pressed()) break;
+        if(hw_button_is_pressed()) break;
     }
-    while(button_is_pressed()) vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
+
+    while(hw_button_is_pressed()){
+        vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
+    }
     vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
 }
 
 
-void user_button0B(void *pvParameters){
+void user_button_task0B(void *pvParameters){
     while (1)
     {
         wait_button_click();
 
         xSemaphoreTake(carousel_manager.carousel_mux, portMAX_DELAY);
-        if(order_manager.erogating){
+
+        if(order_manager.erogating){ //if an order is been erogated we cant access the carousel.
             order_manager.bl_user++;
             ui_state = UI_WAIT_MIX;
             xSemaphoreGive(carousel_manager.carousel_mux);
@@ -334,7 +341,7 @@ void user_button0B(void *pvParameters){
             //token passing from task1A to task0B of carousel mux
         }
 
-        xSemaphoreTake(order_manager.order_mux, portMAX_DELAY);
+        //xSemaphoreTake(order_manager.order_mux, portMAX_DELAY);
 
 
         for(int i=0; i<CAROUSEL_CUPS_SLOTS; i++){ //i assume the user do something on the carousel, so the state of each slot is not ready
@@ -347,6 +354,7 @@ void user_button0B(void *pvParameters){
         carousel_manager.current_ready_slot=-1;
 
         hw_carousel_move_to_rest();
+        hw_carousel_release();
         ui_state = UI_USER_TURN;
 
         printf("USER USING CAROUSEL \n");
@@ -356,18 +364,16 @@ void user_button0B(void *pvParameters){
 
         if(carousel_manager.bl_cr>0){
             xSemaphoreGive(carousel_manager.user_action_sem);
-            xSemaphoreGive(order_manager.order_mux);
+            //xSemaphoreGive(order_manager.order_mux);
         }else{
-            xSemaphoreGive(order_manager.order_mux);
+            //xSemaphoreGive(order_manager.order_mux);
             xSemaphoreGive(carousel_manager.carousel_mux);
         }
 
     }
 }
 
-#define UI_REFRESH_MS 100
-
-void display_task0D(void *pvParameters){
+void display_task0C(void *pvParameters){
     ui_snapshot_t s = {0};
     bool was_on[N_PUMPS] = {false};
     bool mix_known = false;       //mix of the current erogation already read
@@ -445,15 +451,15 @@ int main() {
     carousel_manager_init();
     order_manager_init();
 
-    xTaskCreateAffinitySet(pumps_task1A, "Pump_Manager", 512, NULL, 3, CORE_1, NULL);
+    xTaskCreateAffinitySet(dispenser_task1A, "Pump_Manager", 512, NULL, 3, CORE_1, NULL);
     xTaskCreateAffinitySet(carousel_task1B, "Carousel_Manager", 512, NULL, 3, CORE_1, NULL);
 
     xTaskCreateAffinitySet(pump_worker_task1C, "Worker_1", 256, NULL, 4, CORE_1, NULL);
     xTaskCreateAffinitySet(pump_worker_task1C, "Worker_2", 256, NULL, 4, CORE_1, NULL);
 
     xTaskCreateAffinitySet(orders_task0A, "Order_Generator", 512, NULL, 3, CORE_0, NULL);
-    xTaskCreateAffinitySet(user_button0B, "User_Action", 512, NULL, 4, CORE_0, NULL);
-    xTaskCreateAffinitySet(display_task0D, "Display", 2048, NULL, 2, CORE_0, NULL);
+    xTaskCreateAffinitySet(user_button_task0B, "User_Action", 512, NULL, 4, CORE_0, NULL);
+    xTaskCreateAffinitySet(display_task0C, "Display", 2048, NULL, 0, CORE_0, NULL);
 
     vTaskStartScheduler();
 
