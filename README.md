@@ -1,3 +1,5 @@
+![alt text](3dStructure/image.png)
+
 # FluidSync
 
 **FluidSync** is an automatic fluid mixer that can create mixtures with up to **6 different fluids**. Thanks to its precision peristaltic pumps, each mix is accurate down to the milliliter.
