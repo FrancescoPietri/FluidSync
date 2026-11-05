@@ -3,7 +3,7 @@
 *.cache
 build
 lvgl
-
+*.cl
 # Prerequisites
 *.d
 
