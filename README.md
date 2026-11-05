@@ -145,3 +145,7 @@ To add a new mix, add an entry to `test_mixes[]` with the percentage of each liq
 ## Author
 
 [Francesco Pietri](https://github.com/FrancescoPietri)
+
+## License
+
+This project is licensed under the [GNU GPL v3.0](LICENSE).
