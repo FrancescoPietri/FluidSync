@@ -16,6 +16,8 @@
 
 #include "FluidSyncHW.h"
 #include "FluidSyncUI.h"
+#include "FluidSyncConfig.h"
+#include "FluidSyncWeb.h"
 
 //order arrival interval
 #define ORDER_MIN_INTERVAL_MS 5000
@@ -23,14 +25,14 @@
 
 #define N_MAX_ORDER 10
 
-#define TIME_PER_PERCENT_MS 429 //for each 1% the pump must go for 429ms, each mix is 100ml
+#define TIME_PER_ML_MS 429 //pump time for 1 ml, same for every pump
 
 //define core affinity
 #define CORE_0 (1 << 0)
 #define CORE_1 (1 << 1)
 
 int ui_state;
-
+/*
 enum liquid_t {
     LIQ_YELLOW  = 0,  
     LIQ_MAGENTA = 1,  
@@ -39,12 +41,14 @@ enum liquid_t {
     LIQ_BLACK   = 4, 
     LIQ_WATER   = 5   
 };
-
+*/
 typedef struct { //define the components of a single mix
     int n_components; 
     int pump_output[N_PUMPS]; //define if a pump needs to be activated and the percentage of liquid
+    int volume_ml;            //total volume of the mix
 } mix;
 
+/*
 #define N_TEST_MIXES 6
 static const mix test_mixes[N_TEST_MIXES] = {
     { 2, { 30,  0, 70,  0,  0,  0 }},  // 0 Green           ~#16B05B
@@ -54,11 +58,11 @@ static const mix test_mixes[N_TEST_MIXES] = {
     { 5, { 40, 35,  5, 15,  5,  0 }},  // 4 Red             ~#C0452F
     { 6, {  5, 20, 50,  5, 10, 10 }},  // 5 Blue            ~#1E4C8B
 };
-
+*/
 
 typedef struct { //define a single pump job
     int pump_id;
-    int percentage;
+    int duration_ms;    //ml of that liquid * TIME_PER_ML_MS
 } pump_job_t;
 
 struct output_carousel_t { //struct to manage the status of the output carousel
@@ -140,6 +144,79 @@ void order_manager_init() {
     order_manager.erogating = false;
 }
 
+//* Machine configuration: liquids and presets, edited from the web page and kept in flash
+static machine_config_t config;
+static SemaphoreHandle_t config_mux; //written only by orders_task0A, read by dispenser and display
+
+static int preset_sum(const preset_cfg_t *p){
+    int s = 0;
+    for(int k = 0; k < N_PUMPS; k++) s += p->pct[k];
+    return s;
+}
+
+static bool config_valid(const machine_config_t *c){
+    if(c->magic != CFG_MAGIC || c->version != CFG_VERSION) return false;
+    for(int i = 0; i < N_PUMPS; i++)
+        if(!memchr(c->liquid[i].name, 0, CFG_NAME_LEN) || !c->liquid[i].name[0]) return false;
+    for(int i = 0; i < CFG_N_PRESETS; i++){
+        const preset_cfg_t *p = &c->preset[i];
+        if(!memchr(p->name, 0, CFG_NAME_LEN)) return false;
+        if(p->name[0] && (preset_sum(p) != 100 || p->volume_ml < CFG_MIN_ML || p->volume_ml > CFG_MAX_ML)) return false;
+    }
+    return true;
+}
+
+//CFG_VERSION 1 layout (pump time per liquid, every mix 100ml): converted so the saved names, colors and presets survive
+typedef struct { char name[CFG_NAME_LEN]; uint32_t color; uint16_t ms_per_pct; } liquid_cfg_v1_t;
+typedef struct { char name[CFG_NAME_LEN]; uint8_t pct[N_PUMPS]; } preset_cfg_v1_t;
+typedef struct { uint32_t magic, version; liquid_cfg_v1_t liquid[N_PUMPS]; preset_cfg_v1_t preset[CFG_N_PRESETS]; } machine_config_v1_t;
+
+void config_init(){
+    config_mux = xSemaphoreCreateMutex();
+    hw_config_load(&config, sizeof config);
+    if(config_valid(&config)) return;
+
+    //first boot (or layout changed): generic liquids, no presets
+    memset(&config, 0, sizeof config);
+    config.magic = CFG_MAGIC;
+    config.version = CFG_VERSION;
+    for(int i = 0; i < N_PUMPS; i++){
+        snprintf(config.liquid[i].name, CFG_NAME_LEN, "Liquid %d", i + 1);
+        config.liquid[i].color = 0x9AA4B2;
+    }
+
+    //saved by the previous firmware: keep it (written in the new layout at the next Save)
+    machine_config_v1_t old;
+    hw_config_load(&old, sizeof old);
+    if(old.magic != CFG_MAGIC || old.version != 1) return;
+    for(int i = 0; i < N_PUMPS; i++){
+        if(!memchr(old.liquid[i].name, 0, CFG_NAME_LEN) || !old.liquid[i].name[0]) continue;
+        memcpy(config.liquid[i].name, old.liquid[i].name, CFG_NAME_LEN);
+        config.liquid[i].color = old.liquid[i].color;
+    }
+    for(int i = 0; i < CFG_N_PRESETS; i++){
+        preset_cfg_t p = {0};
+        memcpy(p.name, old.preset[i].name, CFG_NAME_LEN);
+        memcpy(p.pct, old.preset[i].pct, N_PUMPS);
+        p.volume_ml = 100;
+        if(memchr(p.name, 0, CFG_NAME_LEN) && p.name[0] && preset_sum(&p) == 100) config.preset[i] = p;
+    }
+}
+
+//writing the flash pauses both cores: only while no mix is poured, otherwise pumps would overpour.
+//Holding carousel_mux keeps a new erogation from starting during the write.
+static bool config_store(const machine_config_t *next){
+    if(xSemaphoreTake(carousel_manager.carousel_mux, pdMS_TO_TICKS(2000)) != pdTRUE) return false;
+    bool ok = !order_manager.erogating && hw_config_save(next, sizeof *next);
+    xSemaphoreGive(carousel_manager.carousel_mux);
+    if(ok){
+        xSemaphoreTake(config_mux, portMAX_DELAY);
+        config = *next;
+        xSemaphoreGive(config_mux);
+    }
+    return ok;
+}
+
 bool push_order(mix m){
     if (order_manager.order_counter==N_MAX_ORDER){
         return false;
@@ -169,8 +246,7 @@ void pump_worker_task1C(void *pvParameters) { //single thread of a pump, pumps m
             hw_pump_on(job.pump_id);
             printf("    PUMP %d STARTED\n", job.pump_id+1);
 
-            int delay_ms = job.percentage * TIME_PER_PERCENT_MS;
-            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+            vTaskDelay(pdMS_TO_TICKS(job.duration_ms));
 
             hw_pump_off(job.pump_id);
             printf("    PUMP %d STOPPED\n", job.pump_id+1);
@@ -204,7 +280,7 @@ void dispenser_task1A(void *pvParameters){
 
         for(int i = 0; i < N_PUMPS; i++) {
             if(out_mix.pump_output[i] > 0) {
-                pump_job_t job = { .pump_id = i, .percentage = out_mix.pump_output[i] };
+                pump_job_t job = { .pump_id = i, .duration_ms = out_mix.pump_output[i] * out_mix.volume_ml * TIME_PER_ML_MS / 100 };
                 xQueueSend(order_manager.pump_queue, &job, portMAX_DELAY);
             }
         }
@@ -282,51 +358,99 @@ void carousel_task1B(void *pvParameters){
     }
 }
 
+/*
 static int random_delay(unsigned int *seed, int min, int max){
     return min + (int)rand_r(seed) % (max - min + 1);
 }
+*/
 
-//mini web server: GET / shows a button, POST /order pushes one random order (WiFi hardware in FluidSyncHW.c).
-//No auth: anyone on the WLAN can press it, the queue is bounded so the worst case is a full queue.
-static const char HTML_PAGE[] =
-    "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>FluidSync</title><body style='font-family:sans-serif;text-align:center'>"
-    "<h1>FluidSync</h1>"
-    "<form method=post action=/order><button style='font-size:2em;padding:1em 2em'>Random order</button></form>";
+//* Web orders and settings (HTTP + page in FluidSyncWeb.c / web/index.html, WiFi in FluidSyncHW.c)
+//No auth: anyone on the machine WLAN (WPA2) can order or change settings.
 
-static bool push_random_order(unsigned int *seed){
+//queues a copy of the preset: editing the preset later does not change orders already queued
+static int order_preset(int i, char *msg, int size){
+    mix m = {0};
+    xSemaphoreTake(config_mux, portMAX_DELAY);
+    const preset_cfg_t *p = &config.preset[i];
+    bool exists = p->name[0] != 0;
+    for(int k = 0; k < N_PUMPS; k++){
+        m.pump_output[k] = p->pct[k];
+        if(p->pct[k] > 0) m.n_components++;
+    }
+    m.volume_ml = p->volume_ml;
+    snprintf(msg, size, "%s", p->name);
+    xSemaphoreGive(config_mux);
+    if(!exists){ snprintf(msg, size, "This preset is empty"); return 400; }
+
     xSemaphoreTake(order_manager.order_mux, portMAX_DELAY);
-    bool ok = push_order(test_mixes[(int)rand_r(seed) % N_TEST_MIXES]);
+    bool ok = push_order(m);
     if(ok && order_manager.bl_out>0){
         order_manager.bl_out--;
         xSemaphoreGive(order_manager.order_sem); //wakes up task dispenser that is waiting for a new order
     }
     xSemaphoreGive(order_manager.order_mux);
+
     printf(ok ? "ORDER PUSHED \n" : "ORDER QUEUE FULL \n");
-    return ok;
+    if(!ok){ snprintf(msg, size, "Queue full, try later"); return 409; }
+    snprintf(msg + strlen(msg), size - strlen(msg), " ordered (%d ml)", m.volume_ml);
+    return 200;
+}
+
+static int apply_setting(const web_request_t *r, char *msg, int size){
+    machine_config_t next;
+    xSemaphoreTake(config_mux, portMAX_DELAY);
+    next = config;
+    xSemaphoreGive(config_mux);
+
+    if(r->type == WEB_SET_LIQUID){
+        next.liquid[r->index] = r->liquid;
+    }else{
+        preset_cfg_t p = r->preset;
+        if(!p.name[0]) memset(&p, 0, sizeof p); //empty name = delete
+        else if(preset_sum(&p) != 100){ snprintf(msg, size, "Percentages add up to %d%%, they must be 100%%", preset_sum(&p)); return 400; }
+        next.preset[r->index] = p;
+    }
+    if(!config_store(&next)){ snprintf(msg, size, "Machine busy (pouring or carousel in use), try again later"); return 409; }
+    snprintf(msg, size, "Saved");
+    return 200;
 }
 
 void orders_task0A(void *pvParameters){
-    unsigned int seed = get_rand_32();
-
     if(!hw_wifi_start_ap(AP_SSID, AP_PASSWORD)){ printf("WiFi setup failed\n"); vTaskDelete(NULL); }
     printf("Connect to WLAN \"%s\", then open http://%s/\n", AP_SSID, HW_WIFI_AP_IP);
 
-    char req[64], resp[sizeof HTML_PAGE + 160];
+    char req[256], msg[80];
     while(1){
         int id = hw_wifi_wait_request(req, sizeof req, 60000);
         if(id < 0) continue;
 
-        int n;
-        if(strncmp(req, "POST /order", 11) == 0){
-            n = snprintf(resp, sizeof resp, "HTTP/1.0 303 See Other\r\nLocation: %s\r\nContent-Length: 0\r\n\r\n",
-                         push_random_order(&seed) ? "/?ok" : "/?full");
-        }else{
-            const char *msg = strncmp(req, "GET /?ok", 8) == 0   ? "<p>Order queued</p>"
-                            : strncmp(req, "GET /?full", 10) == 0 ? "<p>Queue full, try later</p>" : "";
-            n = snprintf(resp, sizeof resp, "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n%s%s", HTML_PAGE, msg);
+        web_request_t r;
+        web_parse(req, &r);
+        switch(r.type){
+            case WEB_PAGE:
+                web_reply_page(id);
+                break;
+            case WEB_CONFIG: {
+                machine_config_t c;
+                xSemaphoreTake(config_mux, portMAX_DELAY);
+                c = config;
+                xSemaphoreGive(config_mux);
+                web_reply_config(id, &c, order_manager.order_counter, N_MAX_ORDER);
+                break;
+            }
+            case WEB_ORDER:
+                web_reply_text(id, order_preset(r.index, msg, sizeof msg), msg);
+                break;
+            case WEB_SET_LIQUID:
+            case WEB_SET_PRESET:
+                web_reply_text(id, apply_setting(&r, msg, sizeof msg), msg);
+                break;
+            case WEB_BAD:
+                web_reply_text(id, 400, "Invalid request");
+                break;
+            default:
+                web_reply_text(id, 404, "Not found");
         }
-        hw_wifi_reply(id, resp, n);
     }
 }
 
@@ -398,6 +522,7 @@ void display_task0C(void *pvParameters){
     ui_snapshot_t s = {0};
     bool was_on[N_PUMPS] = {false};
     bool mix_known = false;       //mix of the current erogation already read
+    int mix_volume = 100;         //ml of that mix
     bool was_erogating = false;
     uint32_t mixes_done = 0;      //counted here: every end of an erogation is a finished mix
     uint32_t since_refresh = UI_REFRESH_MS;
@@ -425,8 +550,16 @@ void display_task0C(void *pvParameters){
                     s.mix_pct[i] = m->pump_output[i];
                     s.pump_state[i] = m->pump_output[i] > 0 ? UI_PUMP_WAITING : UI_PUMP_UNUSED;
                 }
+                mix_volume = m->volume_ml;
                 mix_known = true;
             }
+
+            xSemaphoreTake(config_mux, portMAX_DELAY);
+            for(int i = 0; i < N_PUMPS; i++){
+                snprintf(s.liquid_name[i], UI_NAME_LEN, "%s", config.liquid[i].name);
+                s.liquid_color[i] = config.liquid[i].color;
+            }
+            xSemaphoreGive(config_mux);
 
             //pump states and progress, from the pump GPIOs
             uint32_t total = 0, poured = 0;
@@ -442,7 +575,7 @@ void display_task0C(void *pvParameters){
                 total += s.mix_pct[i];
                 if(s.pump_state[i] == UI_PUMP_DONE) poured += s.mix_pct[i];
                 else if(s.pump_state[i] == UI_PUMP_RUNNING){
-                    uint32_t p = on_ms / TIME_PER_PERCENT_MS;
+                    uint32_t p = on_ms * 100 / (TIME_PER_ML_MS * mix_volume); //1% of the mix = volume/100 ml
                     poured += p < s.mix_pct[i] ? p : s.mix_pct[i];
                 }
             }
@@ -471,6 +604,7 @@ int main() {
 
     carousel_manager_init();
     order_manager_init();
+    config_init();
 
     xTaskCreateAffinitySet(dispenser_task1A, "Pump_Manager", 512, NULL, 3, CORE_1, NULL);
     xTaskCreateAffinitySet(carousel_task1B, "Carousel_Manager", 512, NULL, 3, CORE_1, NULL);

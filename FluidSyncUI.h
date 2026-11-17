@@ -10,6 +10,7 @@
 #include "FluidSyncHW.h" //N_PUMPS, CAROUSEL_CUPS_SLOTS
 
 #define UI_REFRESH_MS 100
+#define UI_NAME_LEN   16
 
 //Status of machine, chosen by the logic
 typedef enum {
@@ -33,6 +34,8 @@ typedef struct {
     int active_slot;                     //slot under the nozzle, -1 = none
     int slot[CAROUSEL_CUPS_SLOTS];       //same codes as carousel_slot: 0=empty cup ready, 1=full, 2=no cup
     float distance_cm[CAROUSEL_CUPS_SLOTS]; //calibration distance per slot, <0 = not measured
+    char liquid_name[N_PUMPS][UI_NAME_LEN]; //configured from the web page
+    uint32_t liquid_color[N_PUMPS];         //0xRRGGBB
     uint8_t mix_pct[N_PUMPS];            //current (or last) mix, percentage of each liquid
     uint8_t pump_state[N_PUMPS];         //UI_PUMP_*
     uint8_t fill_pct;                    //progress of the current mix, 0..100

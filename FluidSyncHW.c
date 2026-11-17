@@ -6,6 +6,9 @@
 #include "hardware/spi.h"
 #include "hardware/timer.h"
 #include "hardware/uart.h"
+#include "hardware/irq.h"
+#include "hardware/flash.h"
+#include "pico/flash.h"
 #include "lvgl/lvgl.h"
 
 #include "FreeRTOS.h"
@@ -95,6 +98,8 @@ static void tft_hardware_init() {
 
     tft_write_cmd(0xD0);  // Power control
     tft_write_data(0xA4); tft_write_data(0xA1);
+
+    tft_write_cmd(0x21);  // Display Inversion On: this ST7789 panel shows inverted colors without it (white bg, green<->purple)
 
     tft_write_cmd(0x29);  // Display On
     sleep_ms(10);
@@ -305,18 +310,60 @@ void hw_display_tick(uint32_t elapsed_ms){
 
 //* WiFi: on-board ESP8285 with AT firmware on UART0. The ESP8285 runs the AP, DHCP and TCP; here only the AT protocol.
 #define ESP_UART uart0
+#define ESP_TRACE 0 //1 = print the AT traffic on the USB serial (debugging)
+#define esp_trace(...) do{ if(ESP_TRACE) printf(__VA_ARGS__); }while(0)
 
-//next byte from the ESP, -1 on timeout. Polls and yields 1 tick: at 115200 baud ~12 bytes/ms, the 32-byte FIFO never overflows
+//RX is interrupt-driven into a ring buffer: the 32-byte UART FIFO alone overflows while we send a long reply
+//(a 2KB chunk takes ~180ms) and the browser's next request arrives meanwhile.
+#define ESP_RX_BUF 2048
+static volatile uint8_t esp_rx[ESP_RX_BUF];
+static volatile uint16_t esp_rx_head, esp_rx_tail; //written by the IRQ / by esp_getc only
+
+static void esp_rx_irq(void){
+    while(uart_is_readable(ESP_UART)){
+        uint8_t c = uart_getc(ESP_UART);
+        uint16_t next = (esp_rx_head + 1) % ESP_RX_BUF;
+        if(next != esp_rx_tail){ esp_rx[esp_rx_head] = c; esp_rx_head = next; } //full: byte dropped
+    }
+}
+
+//next byte from the ESP, -1 on timeout
 static int esp_getc(uint32_t timeout_ms){
     TickType_t start = xTaskGetTickCount();
-    while(!uart_is_readable(ESP_UART)){
+    while(esp_rx_tail == esp_rx_head){
         if(xTaskGetTickCount() - start >= pdMS_TO_TICKS(timeout_ms)) return -1;
         vTaskDelay(1);
     }
-    return uart_getc(ESP_UART);
+    uint8_t c = esp_rx[esp_rx_tail];
+    esp_rx_tail = (esp_rx_tail + 1) % ESP_RX_BUF;
+    return c;
 }
 
-//one line from the ESP without "\r\n", -1 on timeout. A "+IPD,id,len:" header ends at ':' (the request bytes follow)
+//Incoming requests ("+IPD") can arrive at any time, also while we wait for the answer to a command
+//(a browser asks for /cfg while the page is still being sent): they are queued here, never dropped.
+#define ESP_PENDING 4   //the ESP keeps max 5 connections, one is the one being served
+#define ESP_REQ_MAX 256 //start of the request kept (the request line is all we parse)
+static struct { int id; char req[ESP_REQ_MAX]; } pending[ESP_PENDING];
+static int pending_n;
+
+//reads the payload of a "+IPD,id,len:" header into the pending queue
+static void esp_stash_request(const char *header){
+    int id, len, n = 0;
+    if(sscanf(header, "+IPD,%d,%d:", &id, &len) != 2) return;
+    esp_trace("esp< +IPD id=%d len=%d\n", id, len);
+    char *dst = pending_n < ESP_PENDING ? pending[pending_n].req : NULL; //queue full: drain and drop
+    for(int i = 0; i < len; i++){
+        int c = esp_getc(1000);
+        if(c < 0) break;
+        if(dst && n < ESP_REQ_MAX - 1) dst[n++] = (char)c;
+    }
+    if(!dst){ printf("wifi: request queue full, request dropped\n"); return; }
+    dst[n] = 0;
+    pending[pending_n++].id = id;
+}
+
+//one line from the ESP without "\r\n", -1 on timeout. The CIPSEND prompt is returned as the line ">".
+//A request is queued (see above) and returned as an empty line, so the caller keeps waiting for its answer.
 static int esp_readline(char *buf, int size, uint32_t timeout_ms){
     int n = 0;
     while(1){
@@ -324,17 +371,24 @@ static int esp_readline(char *buf, int size, uint32_t timeout_ms){
         if(c < 0) return -1;
         if(c == '\r') continue;
         if(c == '\n'){ if(n == 0) continue; break; }
+        if(c == '>' && n == 0){ buf[n++] = '>'; break; }
         if(n < size - 1) buf[n++] = (char)c;
-        if(c == ':' && n > 5 && strncmp(buf, "+IPD,", 5) == 0) break;
+        if(c == ':' && n > 5 && strncmp(buf, "+IPD,", 5) == 0){
+            buf[n] = 0;
+            esp_stash_request(buf);
+            n = 0;
+            break;
+        }
     }
     buf[n] = 0;
+    if(n) esp_trace("esp< %s\n", buf);
     return n;
 }
 
 //send a command and wait for OK. Unrelated lines in between (CONNECT, CLOSED, ...) are skipped
-//shortcut: a request arriving while we wait here is dropped (browser just retries/times out), fine for one user at a time
 static bool esp_cmd(const char *cmd, uint32_t timeout_ms){
     char line[96];
+    esp_trace("esp> %s\n", cmd);
     uart_puts(ESP_UART, cmd);
     uart_puts(ESP_UART, "\r\n");
     while(esp_readline(line, sizeof line, timeout_ms) >= 0){
@@ -348,6 +402,9 @@ bool hw_wifi_start_ap(const char *ssid, const char *password){
     uart_init(ESP_UART, ESP_BAUD);
     gpio_set_function(ESP_TX_PIN, GPIO_FUNC_UART);
     gpio_set_function(ESP_RX_PIN, GPIO_FUNC_UART);
+    irq_set_exclusive_handler(UART0_IRQ, esp_rx_irq); //runs on this task's core
+    irq_set_enabled(UART0_IRQ, true);
+    uart_set_irq_enables(ESP_UART, true, false);
     vTaskDelay(pdMS_TO_TICKS(1500)); //ESP8285 boot time
 
     //most of these boards ship without AT firmware: keep retrying and say so on the USB serial
@@ -367,32 +424,69 @@ bool hw_wifi_start_ap(const char *ssid, const char *password){
 
 int hw_wifi_wait_request(char *req, int size, uint32_t timeout_ms){
     char line[96];
-    int id, len;
-    do{
+    while(pending_n == 0) //CONNECT/CLOSED/... lines are skipped, requests are queued by esp_readline
         if(esp_readline(line, sizeof line, timeout_ms) < 0) return -1;
-    }while(sscanf(line, "+IPD,%d,%d:", &id, &len) != 2); //skip CONNECT/CLOSED/... lines
 
-    //keep the start of the request, drain the rest (headers)
-    int n = 0;
-    for(int i = 0; i < len; i++){
-        int c = esp_getc(1000);
-        if(c < 0) break;
-        if(n < size - 1) req[n++] = (char)c;
-    }
-    req[n] = 0;
+    int id = pending[0].id;
+    snprintf(req, size, "%s", pending[0].req);
+    printf("wifi: [%d] %.*s\n", id, (int)strcspn(req, "\r\n"), req); //request line, for debugging on the USB serial
+    pending_n--;
+    memmove(&pending[0], &pending[1], pending_n * sizeof pending[0]);
     return id;
 }
 
-void hw_wifi_reply(int id, const char *data, int len){
+#define ESP_MAX_SEND 2048 //AT+CIPSEND limit per call
+
+bool hw_wifi_send(int id, const char *data, int len){
     char cmd[32];
-    snprintf(cmd, sizeof cmd, "AT+CIPSEND=%d,%d\r\n", id, len);
-    uart_puts(ESP_UART, cmd);
-    int c;
-    do c = esp_getc(2000); while(c >= 0 && c != '>'); //ESP is ready for the payload
-    if(c >= 0){
-        uart_write_blocking(ESP_UART, (const uint8_t *)data, len);
-        while(esp_readline(cmd, sizeof cmd, 3000) >= 0 && strcmp(cmd, "SEND OK") != 0 && strcmp(cmd, "SEND FAIL") != 0);
+    while(len > 0){
+        int chunk = len < ESP_MAX_SEND ? len : ESP_MAX_SEND;
+        snprintf(cmd, sizeof cmd, "AT+CIPSEND=%d,%d\r\n", id, chunk);
+        esp_trace("esp> %s", cmd);
+        uart_puts(ESP_UART, cmd);
+        while(1){ //wait for the ">" prompt: the ESP is ready for the payload
+            if(esp_readline(cmd, sizeof cmd, 2000) < 0) return false;
+            if(strcmp(cmd, ">") == 0) break;
+            if(strcmp(cmd, "ERROR") == 0) return false; //connection already closed by the client
+        }
+        uart_write_blocking(ESP_UART, (const uint8_t *)data, chunk);
+        while(1){
+            if(esp_readline(cmd, sizeof cmd, 3000) < 0) return false;
+            if(strcmp(cmd, "SEND OK") == 0) break;
+            if(strcmp(cmd, "SEND FAIL") == 0 || strcmp(cmd, "ERROR") == 0) return false;
+        }
+        data += chunk;
+        len -= chunk;
     }
+    return true;
+}
+
+void hw_wifi_close(int id){
+    char cmd[24];
     snprintf(cmd, sizeof cmd, "AT+CIPCLOSE=%d", id);
     esp_cmd(cmd, 2000);
+}
+
+//* Config storage: last 4KB sector of the flash, far after the program
+#define CFG_FLASH_OFFSET (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
+#define CFG_FLASH_MAX    1024 //bytes reserved for the config (multiple of FLASH_PAGE_SIZE)
+
+static uint8_t cfg_page[CFG_FLASH_MAX]; //flash is programmed from RAM
+
+static void cfg_flash_write(void *param){
+    flash_range_erase(CFG_FLASH_OFFSET, FLASH_SECTOR_SIZE);
+    flash_range_program(CFG_FLASH_OFFSET, cfg_page, CFG_FLASH_MAX);
+}
+
+void hw_config_load(void *dst, size_t len){
+    memcpy(dst, (const void *)(XIP_BASE + CFG_FLASH_OFFSET), len < CFG_FLASH_MAX ? len : CFG_FLASH_MAX);
+}
+
+bool hw_config_save(const void *src, size_t len){
+    extern char __flash_binary_end;
+    if(len > CFG_FLASH_MAX || (uintptr_t)&__flash_binary_end > XIP_BASE + CFG_FLASH_OFFSET) return false; //would overwrite the program
+    memset(cfg_page, 0xFF, sizeof cfg_page);
+    memcpy(cfg_page, src, len);
+    //pauses the other core and the interrupts for ~50ms (erase + program)
+    return flash_safe_execute(cfg_flash_write, NULL, 1000) == PICO_OK;
 }

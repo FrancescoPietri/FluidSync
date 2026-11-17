@@ -11,29 +11,34 @@
 #define SCR_W 320
 #define SCR_H 240
 
-#define COL_BG       0x10141B
-#define COL_PANEL    0x1B212C
-#define COL_TEXT     0xFFFFFF
-#define COL_MUTED    0x8A94A6
-#define COL_OUTLINE  0x3A4352
-#define COL_ACCENT   0x3B82F6
+//light theme
+#define COL_BG       0xF3F4F6
+#define COL_PANEL    0xFFFFFF
+#define COL_TEXT     0x111827
+#define COL_MUTED    0x6B7280
+#define COL_OUTLINE  0xD1D5DB
+#define COL_ACCENT   0x2563EB
+#define COL_CUP      0x6B7280  //outline of a cup that is present
+#define COL_RUN_BG   0xDBEAFE  //chip of a running pump
+#define COL_IDLE_BG  0xE5E7EB  //neutral banner
 
-//liquid colors, same order as the pumps: yellow, magenta, cyan, white, black, water
+//liquid names and colors now come from the config (ui_snapshot_t)
+/*
 static const uint32_t liquid_color[N_PUMPS] = { 0xFFD400, 0xE4007C, 0x00A3E0, 0xF5F5F5, 0x222222, 0x9FD8FF };
 static const char *liquid_name[N_PUMPS] = { "Y", "M", "C", "W", "K", "H2O" };
+*/
 
 //colors of the status banner
 typedef struct { uint32_t bg; uint32_t fg; const char *icon; const char *title; const char *sub; } banner_t;
 
 //* Mix color
 //approximation of paint mixing: weighted geometric mean of each channel (subtractive-like).
-//water only dilutes, so it is treated as white.
-static lv_color_t mix_color(const uint8_t pct[N_PUMPS]) {
+static lv_color_t mix_color(const uint8_t pct[N_PUMPS], const uint32_t color[N_PUMPS]) {
     double acc[3] = { 0, 0, 0 };
     int tot = 0;
     for (int i = 0; i < N_PUMPS; i++) {
         if (pct[i] == 0) continue;
-        uint32_t c = (i == 5) ? 0xF5F5F5 : liquid_color[i];
+        uint32_t c = color[i];
         int ch[3] = { (c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF };
         for (int k = 0; k < 3; k++) acc[k] += pct[i] * log(ch[k] < 13 ? 13 : ch[k]);
         tot += pct[i];
@@ -54,7 +59,7 @@ static lv_obj_t *cup_dist[CAROUSEL_CUPS_SLOTS];  //calibration distance below th
 static lv_obj_t *cup_arrow[CAROUSEL_CUPS_SLOTS]; //arrow on the slot under the nozzle
 
 static lv_obj_t *swatch;
-static lv_obj_t *chip[N_PUMPS], *chip_label[N_PUMPS];
+static lv_obj_t *chip[N_PUMPS], *chip_label[N_PUMPS], *chip_dot[N_PUMPS];
 
 //last drawn values, to redraw only what changed
 static ui_snapshot_t shown;
@@ -144,13 +149,15 @@ void ui_create(void) {
         lv_obj_set_style_border_width(chip[i], 1, 0);
         lv_obj_set_style_border_color(chip[i], lv_color_hex(COL_OUTLINE), 0);
 
-        lv_obj_t *dot = box(chip[i], 5, 5, 11, 11, liquid_color[i]);
-        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_border_width(dot, 1, 0);
-        lv_obj_set_style_border_color(dot, lv_color_hex(COL_MUTED), 0);
+        chip_dot[i] = box(chip[i], 5, 5, 11, 11, COL_OUTLINE);
+        lv_obj_set_style_radius(chip_dot[i], LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_border_width(chip_dot[i], 1, 0);
+        lv_obj_set_style_border_color(chip_dot[i], lv_color_hex(COL_MUTED), 0);
 
         chip_label[i] = text(chip[i], &lv_font_montserrat_14, COL_TEXT);
         lv_obj_set_pos(chip_label[i], 20, 2);
+        lv_obj_set_width(chip_label[i], 84 - 22);
+        lv_label_set_long_mode(chip_label[i], LV_LABEL_LONG_CLIP); //long names are cut, not wrapped
     }
 
     for (int i = 0; i < CAROUSEL_CUPS_SLOTS; i++) slot_color[i] = lv_color_hex(COL_OUTLINE);
@@ -171,8 +178,8 @@ static banner_t banner_for(const ui_snapshot_t *s) {
                 return (banner_t){ 0x2563EB, 0xFFFFFF, LV_SYMBOL_PLAY, title, "Do not touch the carousel" };
             }
             if (s->queue_len == 0)
-                return (banner_t){ 0x2B3240, 0xFFFFFF, LV_SYMBOL_LIST, "WAITING FOR ORDERS", "Ready" };
-            return (banner_t){ 0x2B3240, 0xFFFFFF, LV_SYMBOL_REFRESH, "CHECKING CUPS", "Looking for an empty cup" };
+                return (banner_t){ COL_IDLE_BG, COL_TEXT, LV_SYMBOL_LIST, "WAITING FOR ORDERS", "Ready" };
+            return (banner_t){ COL_IDLE_BG, COL_TEXT, LV_SYMBOL_REFRESH, "CHECKING CUPS", "Looking for an empty cup" };
     }
 }
 
@@ -198,8 +205,10 @@ void ui_update(const ui_snapshot_t *s) {
         lv_obj_set_style_text_opa(banner_sub, LV_OPA_80, 0);
     }
 
-    lv_color_t mc = mix_color(s->mix_pct);
-    bool mix_changed = first || memcmp(s->mix_pct, shown.mix_pct, sizeof s->mix_pct) != 0;
+    bool liquids_changed = first || memcmp(s->liquid_name, shown.liquid_name, sizeof s->liquid_name) != 0 ||
+                           memcmp(s->liquid_color, shown.liquid_color, sizeof s->liquid_color) != 0;
+    lv_color_t mc = mix_color(s->mix_pct, s->liquid_color);
+    bool mix_changed = first || liquids_changed || memcmp(s->mix_pct, shown.mix_pct, sizeof s->mix_pct) != 0;
 
     //cups
     for (int i = 0; i < CAROUSEL_CUPS_SLOTS; i++) {
@@ -228,12 +237,12 @@ void ui_update(const ui_snapshot_t *s) {
             snprintf(buf, sizeof buf, "%d  %d%%", i + 1, s->fill_pct);
             state = buf;
         } else if (s->slot[i] == 1) {
-            border = 0xC8CED8; label_col = COL_TEXT;
+            border = COL_CUP; label_col = COL_TEXT;
             level = 100;
             snprintf(buf, sizeof buf, "%d  FULL", i + 1);
             state = buf;
         } else if (s->slot[i] == 0) {
-            border = 0xC8CED8; label_col = COL_TEXT;
+            border = COL_CUP; label_col = COL_TEXT;
             snprintf(buf, sizeof buf, "%d  EMPTY", i + 1);
             state = buf;
         } else {
@@ -259,13 +268,14 @@ void ui_update(const ui_snapshot_t *s) {
     for (int i = 0; i < N_PUMPS; i++) {
         if (!mix_changed && s->pump_state[i] == shown.pump_state[i]) continue;
         uint8_t st = s->pump_state[i];
-        if (s->mix_pct[i] == 0) snprintf(buf, sizeof buf, "%s", liquid_name[i]);
-        else if (st == UI_PUMP_DONE) snprintf(buf, sizeof buf, "%s %d%% " LV_SYMBOL_OK, liquid_name[i], s->mix_pct[i]);
-        else snprintf(buf, sizeof buf, "%s %d%%", liquid_name[i], s->mix_pct[i]);
+        if (liquids_changed) lv_obj_set_style_bg_color(chip_dot[i], lv_color_hex(s->liquid_color[i]), 0);
+        if (s->mix_pct[i] == 0) snprintf(buf, sizeof buf, "%s", s->liquid_name[i]);
+        else if (st == UI_PUMP_DONE) snprintf(buf, sizeof buf, "%d%% " LV_SYMBOL_OK " %s", s->mix_pct[i], s->liquid_name[i]);
+        else snprintf(buf, sizeof buf, "%d%% %s", s->mix_pct[i], s->liquid_name[i]);
         lv_label_set_text(chip_label[i], buf);
         lv_obj_set_style_opa(chip[i], s->mix_pct[i] == 0 ? LV_OPA_40 : LV_OPA_COVER, 0);
         //running pump: blue chip
-        lv_obj_set_style_bg_color(chip[i], lv_color_hex(st == UI_PUMP_RUNNING ? 0x1E3A8A : COL_BG), 0);
+        lv_obj_set_style_bg_color(chip[i], lv_color_hex(st == UI_PUMP_RUNNING ? COL_RUN_BG : COL_BG), 0);
         lv_obj_set_style_border_color(chip[i], lv_color_hex(st == UI_PUMP_RUNNING ? COL_ACCENT : COL_OUTLINE), 0);
         lv_obj_set_style_border_width(chip[i], st == UI_PUMP_RUNNING ? 2 : 1, 0);
     }

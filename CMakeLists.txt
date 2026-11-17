@@ -38,7 +38,16 @@ include(${FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/RP2040/FreeRTOS_Kernel_i
 
 pico_sdk_init()
 
-add_executable(FluidSync FluidSync.c FluidSyncHW.c FluidSyncUI.c)
+add_executable(FluidSync FluidSync.c FluidSyncHW.c FluidSyncUI.c FluidSyncWeb.c)
+
+# web/index.html (the web app graphics) is embedded as a byte array: edit the HTML and rebuild
+set(WEB_INDEX ${CMAKE_CURRENT_LIST_DIR}/web/index.html)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${WEB_INDEX})
+file(READ ${WEB_INDEX} WEB_HEX HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," WEB_HEX "${WEB_HEX}")
+file(CONFIGURE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/web_index.h
+     CONTENT "//generated from web/index.html, do not edit\nstatic const char WEB_INDEX_HTML[] = {@WEB_HEX@};\n" @ONLY)
+target_include_directories(FluidSync PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 add_subdirectory(lvgl)
 target_include_directories(lvgl PUBLIC ${CMAKE_CURRENT_LIST_DIR})
@@ -69,6 +78,8 @@ target_link_libraries(FluidSync PRIVATE
         hardware_pwm
         lvgl
         hardware_spi
+        hardware_flash
+        pico_flash
         hardware_timer
 )
 

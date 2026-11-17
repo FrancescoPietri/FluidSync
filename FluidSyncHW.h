@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 //* Pumps Pins
 #define N_PUMPS 6
@@ -53,7 +54,7 @@
 
 void hw_init(void);
 
-//pompe: id 0..5 = PUMP_1..PUMP_6 = yellow, magenta, cyan, white, black, water
+//pumps: id 0..5 = PUMP_1..PUMP_6, the liquid in each one is configured from the web page
 void hw_pump_on(uint8_t pump_id);
 void hw_pump_off(uint8_t pump_id);
 void hw_all_pumps_off(void);
@@ -79,5 +80,11 @@ void hw_display_tick(uint32_t elapsed_ms);
 bool hw_wifi_start_ap(const char *ssid, const char *password);
 //waits for an HTTP request on port 80: returns the connection id (-1 on timeout), req = start of the request
 int hw_wifi_wait_request(char *req, int size, uint32_t timeout_ms);
-//sends data on connection id, then closes it
-void hw_wifi_reply(int id, const char *data, int len);
+//sends data on connection id (any length, split in ESP-sized chunks), false if the connection is gone
+bool hw_wifi_send(int id, const char *data, int len);
+void hw_wifi_close(int id);
+
+//config storage in the last flash sector. load copies the raw bytes (the caller checks them),
+//save pauses both cores ~50ms: do not call while pumps are running (their timing would stretch)
+void hw_config_load(void *dst, size_t len);
+bool hw_config_save(const void *src, size_t len);
