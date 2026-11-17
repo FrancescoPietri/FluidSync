@@ -25,12 +25,18 @@
 //* Distance Sensor Pin
 #define DISTANCE_ECHO 7
 #define DISTANCE_TRIG 6
-#define CUP_MAX_DISTANCE_CM 9.0f 
+#define CUP_MAX_DISTANCE_CM 16.0f 
 
 //* Button Pin
 #define UNLOAD_BUTTON 9
 #define BUTTON_POLL_MS     50
 #define BUTTON_DEBOUNCE_MS 30
+
+//* WiFi: ESP8285 (AT firmware) on UART0
+#define ESP_TX_PIN 0 //RP2040 TX -> ESP RX
+#define ESP_RX_PIN 1 //RP2040 RX <- ESP TX
+#define ESP_BAUD   115200
+#define HW_WIFI_AP_IP "192.168.4.1" //ESP8285 default AP address
 
 //* TFT Display Pins
 #define TFT_SDA 18
@@ -58,11 +64,20 @@ void hw_carousel_move_to_slot(int slot); //slot 0..3
 void hw_carousel_move_to_rest(void);     
 void hw_carousel_release(void);  
 
-//check if a cup is present, based on ultrasonic sensor, distance < 15
-bool hw_cup_present(void);
+//check if a cup is present, based on ultrasonic sensor, distance < CUP_MAX_DISTANCE_CM
+//*dist_cm (if not NULL) = measured median distance, -1 if no valid echo
+bool hw_cup_present(float *dist_cm);
 
 bool hw_button_is_pressed(void);
 
 //display: call ONLY from the display task (LVGL is not thread-safe). The screen itself is in FluidSyncUI.c
 void hw_display_init(void);
 void hw_display_tick(uint32_t elapsed_ms);
+
+//WiFi: call ONLY from one task (the UART is not shared). Blocks until the ESP answers AT, false if the AP/server setup fails.
+//Password min 8 chars, no quotes or commas.
+bool hw_wifi_start_ap(const char *ssid, const char *password);
+//waits for an HTTP request on port 80: returns the connection id (-1 on timeout), req = start of the request
+int hw_wifi_wait_request(char *req, int size, uint32_t timeout_ms);
+//sends data on connection id, then closes it
+void hw_wifi_reply(int id, const char *data, int len);

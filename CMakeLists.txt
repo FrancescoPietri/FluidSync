@@ -43,6 +43,11 @@ add_executable(FluidSync FluidSync.c FluidSyncHW.c FluidSyncUI.c)
 add_subdirectory(lvgl)
 target_include_directories(lvgl PUBLIC ${CMAKE_CURRENT_LIST_DIR})
 
+# WLAN created by the on-board ESP8285 for the order web server. Change with: cmake -DAP_SSID=.. -DAP_PASSWORD=.. (min 8 chars, no quotes or commas)
+set(AP_SSID "FluidSync" CACHE STRING "Access point name")
+set(AP_PASSWORD "fluidsync" CACHE STRING "Access point password")
+target_compile_definitions(FluidSync PRIVATE AP_SSID="${AP_SSID}" AP_PASSWORD="${AP_PASSWORD}")
+
 pico_set_program_name(FluidSync "FluidSync")
 pico_set_program_version(FluidSync "0.1")
 

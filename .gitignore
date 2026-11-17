@@ -4,6 +4,8 @@
 build
 lvgl
 *.cl
+graphify-out
+
 # Prerequisites
 *.d
 

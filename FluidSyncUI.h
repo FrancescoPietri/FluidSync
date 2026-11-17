@@ -32,6 +32,7 @@ typedef struct {
     bool dispensing;                     //a mix is being poured in active_slot
     int active_slot;                     //slot under the nozzle, -1 = none
     int slot[CAROUSEL_CUPS_SLOTS];       //same codes as carousel_slot: 0=empty cup ready, 1=full, 2=no cup
+    float distance_cm[CAROUSEL_CUPS_SLOTS]; //calibration distance per slot, <0 = not measured
     uint8_t mix_pct[N_PUMPS];            //current (or last) mix, percentage of each liquid
     uint8_t pump_state[N_PUMPS];         //UI_PUMP_*
     uint8_t fill_pct;                    //progress of the current mix, 0..100

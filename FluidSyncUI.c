@@ -50,6 +50,7 @@ static lv_obj_t *banner, *banner_title, *banner_sub;
 static lv_obj_t *cup[CAROUSEL_CUPS_SLOTS];       //cup outline
 static lv_obj_t *cup_fill[CAROUSEL_CUPS_SLOTS];  //liquid inside
 static lv_obj_t *cup_label[CAROUSEL_CUPS_SLOTS];
+static lv_obj_t *cup_dist[CAROUSEL_CUPS_SLOTS];  //calibration distance below the label
 static lv_obj_t *cup_arrow[CAROUSEL_CUPS_SLOTS]; //arrow on the slot under the nozzle
 
 static lv_obj_t *swatch;
@@ -61,7 +62,7 @@ static bool first = true;
 static lv_color_t slot_color[CAROUSEL_CUPS_SLOTS]; //color of the mix poured in each full cup
 
 #define CUP_W 50
-#define CUP_H 62
+#define CUP_H 54
 
 static lv_obj_t *box(lv_obj_t *parent, int x, int y, int w, int h, uint32_t bg) {
     lv_obj_t *o = lv_obj_create(parent);
@@ -120,7 +121,13 @@ void ui_create(void) {
         cup_label[i] = text(scr, &lv_font_montserrat_14, COL_MUTED);
         lv_obj_set_width(cup_label[i], SCR_W / CAROUSEL_CUPS_SLOTS);
         lv_obj_set_style_text_align(cup_label[i], LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_pos(cup_label[i], i * (SCR_W / CAROUSEL_CUPS_SLOTS), 166);
+        lv_obj_set_pos(cup_label[i], i * (SCR_W / CAROUSEL_CUPS_SLOTS), 156);
+
+        cup_dist[i] = text(scr, &lv_font_montserrat_14, COL_MUTED);
+        lv_obj_set_width(cup_dist[i], SCR_W / CAROUSEL_CUPS_SLOTS);
+        lv_obj_set_style_text_align(cup_dist[i], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_pos(cup_dist[i], i * (SCR_W / CAROUSEL_CUPS_SLOTS), 171);
+        lv_label_set_text(cup_dist[i], "-- cm");
     }
 
     //current mix: color swatch + one chip per pump
@@ -198,6 +205,12 @@ void ui_update(const ui_snapshot_t *s) {
     for (int i = 0; i < CAROUSEL_CUPS_SLOTS; i++) {
         bool filling = s->dispensing && s->active_slot == i;
         bool was_filling = !first && shown.dispensing && shown.active_slot == i;
+        if (first || s->distance_cm[i] != shown.distance_cm[i]) {
+            if (s->distance_cm[i] < 0) snprintf(buf, sizeof buf, "-- cm");
+            else snprintf(buf, sizeof buf, "%.1f cm", s->distance_cm[i]);
+            lv_label_set_text(cup_dist[i], buf);
+        }
+
         if (!first && s->slot[i] == shown.slot[i] && filling == was_filling &&
             !(filling && (s->fill_pct != shown.fill_pct || mix_changed)) &&
             (s->active_slot == i) == (shown.active_slot == i))

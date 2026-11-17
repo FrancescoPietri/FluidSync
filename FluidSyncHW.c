@@ -1,9 +1,11 @@
 //FluidSync - livello hardware (driver e init), dal codice hardware di Francesco
 #include <stdio.h>
+#include <string.h>
 #include "pico/stdlib.h"
 #include "hardware/pwm.h"
 #include "hardware/spi.h"
 #include "hardware/timer.h"
+#include "hardware/uart.h"
 #include "lvgl/lvgl.h"
 
 #include "FreeRTOS.h"
@@ -244,7 +246,8 @@ static float get_distance() {
     return (pulse_duration * 0.0343f) / 2.0f;
 }
 
-bool hw_cup_present(void){
+bool hw_cup_present(float *dist_cm){
+    if (dist_cm) *dist_cm = -1.0f;
     float d[SENSOR_READINGS];
     int n = 0;
 
@@ -268,6 +271,7 @@ bool hw_cup_present(void){
         d[j + 1] = v;
     }
     float median = d[n / 2];
+    if (dist_cm) *dist_cm = median;
     printf("distance: %.1f cm (median of %d)\n", median, n);
     return median < CUP_MAX_DISTANCE_CM;
 }
@@ -297,4 +301,98 @@ void hw_display_init(void){
 void hw_display_tick(uint32_t elapsed_ms){
     lv_tick_inc(elapsed_ms);
     lv_timer_handler();
+}
+
+//* WiFi: on-board ESP8285 with AT firmware on UART0. The ESP8285 runs the AP, DHCP and TCP; here only the AT protocol.
+#define ESP_UART uart0
+
+//next byte from the ESP, -1 on timeout. Polls and yields 1 tick: at 115200 baud ~12 bytes/ms, the 32-byte FIFO never overflows
+static int esp_getc(uint32_t timeout_ms){
+    TickType_t start = xTaskGetTickCount();
+    while(!uart_is_readable(ESP_UART)){
+        if(xTaskGetTickCount() - start >= pdMS_TO_TICKS(timeout_ms)) return -1;
+        vTaskDelay(1);
+    }
+    return uart_getc(ESP_UART);
+}
+
+//one line from the ESP without "\r\n", -1 on timeout. A "+IPD,id,len:" header ends at ':' (the request bytes follow)
+static int esp_readline(char *buf, int size, uint32_t timeout_ms){
+    int n = 0;
+    while(1){
+        int c = esp_getc(timeout_ms);
+        if(c < 0) return -1;
+        if(c == '\r') continue;
+        if(c == '\n'){ if(n == 0) continue; break; }
+        if(n < size - 1) buf[n++] = (char)c;
+        if(c == ':' && n > 5 && strncmp(buf, "+IPD,", 5) == 0) break;
+    }
+    buf[n] = 0;
+    return n;
+}
+
+//send a command and wait for OK. Unrelated lines in between (CONNECT, CLOSED, ...) are skipped
+//shortcut: a request arriving while we wait here is dropped (browser just retries/times out), fine for one user at a time
+static bool esp_cmd(const char *cmd, uint32_t timeout_ms){
+    char line[96];
+    uart_puts(ESP_UART, cmd);
+    uart_puts(ESP_UART, "\r\n");
+    while(esp_readline(line, sizeof line, timeout_ms) >= 0){
+        if(strcmp(line, "OK") == 0 || strcmp(line, "no change") == 0) return true;
+        if(strcmp(line, "ERROR") == 0 || strcmp(line, "FAIL") == 0) return false;
+    }
+    return false;
+}
+
+bool hw_wifi_start_ap(const char *ssid, const char *password){
+    uart_init(ESP_UART, ESP_BAUD);
+    gpio_set_function(ESP_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(ESP_RX_PIN, GPIO_FUNC_UART);
+    vTaskDelay(pdMS_TO_TICKS(1500)); //ESP8285 boot time
+
+    //most of these boards ship without AT firmware: keep retrying and say so on the USB serial
+    while(!esp_cmd("AT", 500)){
+        printf("ESP8285 does not answer AT on GP%d/GP%d @%d: flash ESP-AT firmware on it\n", ESP_TX_PIN, ESP_RX_PIN, ESP_BAUD);
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+    char sap[128];
+    snprintf(sap, sizeof sap, "AT+CWSAP=\"%s\",\"%s\",5,3", ssid, password); //channel 5, WPA2-PSK
+    return esp_cmd("ATE0", 1000)               //no echo
+        && esp_cmd("AT+CWMODE=2", 2000)        //access point
+        && esp_cmd(sap, 5000)
+        && esp_cmd("AT+CIPMUX=1", 1000)        //needed by the server
+        && esp_cmd("AT+CIPSERVER=1,80", 2000)
+        && esp_cmd("AT+CIPSTO=10", 1000);      //drop idle connections (ESP holds max 5)
+}
+
+int hw_wifi_wait_request(char *req, int size, uint32_t timeout_ms){
+    char line[96];
+    int id, len;
+    do{
+        if(esp_readline(line, sizeof line, timeout_ms) < 0) return -1;
+    }while(sscanf(line, "+IPD,%d,%d:", &id, &len) != 2); //skip CONNECT/CLOSED/... lines
+
+    //keep the start of the request, drain the rest (headers)
+    int n = 0;
+    for(int i = 0; i < len; i++){
+        int c = esp_getc(1000);
+        if(c < 0) break;
+        if(n < size - 1) req[n++] = (char)c;
+    }
+    req[n] = 0;
+    return id;
+}
+
+void hw_wifi_reply(int id, const char *data, int len){
+    char cmd[32];
+    snprintf(cmd, sizeof cmd, "AT+CIPSEND=%d,%d\r\n", id, len);
+    uart_puts(ESP_UART, cmd);
+    int c;
+    do c = esp_getc(2000); while(c >= 0 && c != '>'); //ESP is ready for the payload
+    if(c >= 0){
+        uart_write_blocking(ESP_UART, (const uint8_t *)data, len);
+        while(esp_readline(cmd, sizeof cmd, 3000) >= 0 && strcmp(cmd, "SEND OK") != 0 && strcmp(cmd, "SEND FAIL") != 0);
+    }
+    snprintf(cmd, sizeof cmd, "AT+CIPCLOSE=%d", id);
+    esp_cmd(cmd, 2000);
 }

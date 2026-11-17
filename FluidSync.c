@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #include "pico/stdlib.h"
@@ -63,6 +64,7 @@ typedef struct { //define a single pump job
 struct output_carousel_t { //struct to manage the status of the output carousel
 
     int carousel_slot[CAROUSEL_CUPS_SLOTS]; //0=ready; 1=full; 2=not ready->no cup in the slot; 3=empty slot 
+    float slot_distance[CAROUSEL_CUPS_SLOTS]; //last calibration distance in cm, -1 = not measured
     int n_filled_slot;
     int n_ready_slot;
     int n_not_ready_slot;
@@ -104,6 +106,7 @@ void carousel_manager_init() {
 
     for(int i=0; i<CAROUSEL_CUPS_SLOTS; i++){
         carousel_manager.carousel_slot[i]=2;
+        carousel_manager.slot_distance[i]=-1.0f;
     }
 
     carousel_manager.n_filled_slot=0;
@@ -256,7 +259,7 @@ void carousel_task1B(void *pvParameters){
                         break;
                     case 2:
                         hw_carousel_move_to_slot(i);
-                        if(hw_cup_present()){
+                        if(hw_cup_present(&carousel_manager.slot_distance[i])){
                             carousel_manager.carousel_slot[i]=0;
                             carousel_manager.n_ready_slot++;
                             carousel_manager.n_not_ready_slot--;
@@ -283,25 +286,47 @@ static int random_delay(unsigned int *seed, int min, int max){
     return min + (int)rand_r(seed) % (max - min + 1);
 }
 
-void orders_task0A(void *pvParameters){ //generate orders at random intervals
-    int seed = get_rand_32();
+//mini web server: GET / shows a button, POST /order pushes one random order (WiFi hardware in FluidSyncHW.c).
+//No auth: anyone on the WLAN can press it, the queue is bounded so the worst case is a full queue.
+static const char HTML_PAGE[] =
+    "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>FluidSync</title><body style='font-family:sans-serif;text-align:center'>"
+    "<h1>FluidSync</h1>"
+    "<form method=post action=/order><button style='font-size:2em;padding:1em 2em'>Random order</button></form>";
 
+static bool push_random_order(unsigned int *seed){
+    xSemaphoreTake(order_manager.order_mux, portMAX_DELAY);
+    bool ok = push_order(test_mixes[(int)rand_r(seed) % N_TEST_MIXES]);
+    if(ok && order_manager.bl_out>0){
+        order_manager.bl_out--;
+        xSemaphoreGive(order_manager.order_sem); //wakes up task dispenser that is waiting for a new order
+    }
+    xSemaphoreGive(order_manager.order_mux);
+    printf(ok ? "ORDER PUSHED \n" : "ORDER QUEUE FULL \n");
+    return ok;
+}
+
+void orders_task0A(void *pvParameters){
+    unsigned int seed = get_rand_32();
+
+    if(!hw_wifi_start_ap(AP_SSID, AP_PASSWORD)){ printf("WiFi setup failed\n"); vTaskDelete(NULL); }
+    printf("Connect to WLAN \"%s\", then open http://%s/\n", AP_SSID, HW_WIFI_AP_IP);
+
+    char req[64], resp[sizeof HTML_PAGE + 160];
     while(1){
-        vTaskDelay(pdMS_TO_TICKS(random_delay(&seed, ORDER_MIN_INTERVAL_MS, ORDER_MAX_INTERVAL_MS)));
-        xSemaphoreTake(order_manager.order_mux, portMAX_DELAY);
-        int rand_mix = (int)rand_r(&seed) % (N_TEST_MIXES);
+        int id = hw_wifi_wait_request(req, sizeof req, 60000);
+        if(id < 0) continue;
 
-        if(push_order(test_mixes[rand_mix])){
-            printf("ORDER PUSHED \n");
-            if(order_manager.bl_out>0){
-                order_manager.bl_out--;
-                xSemaphoreGive(order_manager.order_sem); //wakes up task dispenser that is waiting for a new order
-            }
+        int n;
+        if(strncmp(req, "POST /order", 11) == 0){
+            n = snprintf(resp, sizeof resp, "HTTP/1.0 303 See Other\r\nLocation: %s\r\nContent-Length: 0\r\n\r\n",
+                         push_random_order(&seed) ? "/?ok" : "/?full");
         }else{
-            printf("ORDER QUEUE FULL \n");
+            const char *msg = strncmp(req, "GET /?ok", 8) == 0   ? "<p>Order queued</p>"
+                            : strncmp(req, "GET /?full", 10) == 0 ? "<p>Queue full, try later</p>" : "";
+            n = snprintf(resp, sizeof resp, "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n%s%s", HTML_PAGE, msg);
         }
-
-        xSemaphoreGive(order_manager.order_mux);
+        hw_wifi_reply(id, resp, n);
     }
 }
 
@@ -341,6 +366,7 @@ void user_button_task0B(void *pvParameters){
 
         for(int i=0; i<CAROUSEL_CUPS_SLOTS; i++){ //i assume the user do something on the carousel, so the state of each slot is not ready
             carousel_manager.carousel_slot[i]=2;
+        carousel_manager.slot_distance[i]=-1.0f;
         }
 
         carousel_manager.n_filled_slot=0;
@@ -425,7 +451,7 @@ void display_task0C(void *pvParameters){
             s.state = (ui_state_t)ui_state;
             s.dispensing = erogating;
             s.active_slot = carousel_manager.current_ready_slot;
-            for(int i = 0; i < CAROUSEL_CUPS_SLOTS; i++) s.slot[i] = carousel_manager.carousel_slot[i];
+            for(int i = 0; i < CAROUSEL_CUPS_SLOTS; i++) { s.slot[i] = carousel_manager.carousel_slot[i]; s.distance_cm[i] = carousel_manager.slot_distance[i]; }
             s.queue_len = order_manager.order_counter;
             s.queue_max = N_MAX_ORDER;
             s.mixes_done = mixes_done;
@@ -452,7 +478,7 @@ int main() {
     xTaskCreateAffinitySet(pump_worker_task1C, "Worker_1", 256, NULL, 4, CORE_1, NULL);
     xTaskCreateAffinitySet(pump_worker_task1C, "Worker_2", 256, NULL, 4, CORE_1, NULL);
 
-    xTaskCreateAffinitySet(orders_task0A, "Order_Generator", 512, NULL, 3, CORE_0, NULL);
+    xTaskCreateAffinitySet(orders_task0A, "Order_Generator", 2048, NULL, 3, CORE_0, NULL);
     xTaskCreateAffinitySet(user_button_task0B, "User_Action", 512, NULL, 4, CORE_0, NULL);
     xTaskCreateAffinitySet(display_task0C, "Display", 2048, NULL, 0, CORE_0, NULL);
 
